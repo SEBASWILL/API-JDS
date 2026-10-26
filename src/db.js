@@ -40,6 +40,14 @@ export function openDb(file) {
       data    BLOB NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions(user_id);
+
+    -- Metas de gasto mensual: límite y categoría van cifrados dentro de "data".
+    CREATE TABLE IF NOT EXISTS goals (
+      id      TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      data    BLOB NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_goals_user ON goals(user_id);
   `);
   return db;
 }

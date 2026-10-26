@@ -4,7 +4,7 @@ import { parseAmount } from './amount.js';
 
 export const STATUSES = ['approved', 'declined', 'pending', 'refunded'];
 
-const amountSchema = z.union([z.number(), z.string()]).transform((v, ctx) => {
+export const amountSchema = z.union([z.number(), z.string()]).transform((v, ctx) => {
   const a = parseAmount(v);
   if (a === null) {
     ctx.addIssue({ code: 'custom', message: 'monto inválido' });
@@ -63,3 +63,10 @@ export function openTx(dek, row) {
     throw e;
   }
 }
+
+/** Todas las transacciones de un usuario, descifradas. */
+export const listTx = (db, userId, dek) =>
+  db.prepare('SELECT * FROM transactions WHERE user_id = ?').all(userId).map((row) => openTx(dek, row));
+
+/** Solo aprobadas y pendientes cuentan como gasto (no declinadas ni reembolsadas). */
+export const counts = (t) => t.status === 'approved' || t.status === 'pending';

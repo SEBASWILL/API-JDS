@@ -7,7 +7,7 @@ va cifrado; en la base de datos solo hay IDs y bytes aleatorios.
 ```bash
 npm install
 cp .env.example .env        # y pon PEPPER=$(openssl rand -hex 32)
-npm test                    # 9 pruebas, incluida la del dump de la BD
+npm test                    # 18 pruebas, incluidas las del dump de la BD
 npm run dev
 ```
 **PEPPER**: guárdalo fuera de la base de datos (variable de entorno del servidor / gestor de secretos).
@@ -42,9 +42,21 @@ Si lo pierdes, nadie puede iniciar sesión; si se filtra junto con la BD, pierde
 | POST/GET | /transactions | crear (tarjeta o `type:"cash"`) / listar con filtros |
 | GET/PATCH/DELETE | /transactions/:id | leer, actualizar (p. ej. `status:"declined"`), borrar |
 | GET | /transactions/summary | totales por categoría y tipo |
+| GET | /reports/daily | `?tz&from&to` gasto por día (por defecto últimos 30), con promedio, día de mayor gasto, días sin gasto y top 5 comercios |
+| GET | /reports/weekly | `?tz&weeks=8` gasto por semana (lunes a domingo) con variación frente a la semana anterior |
+| POST/GET | /goals | crear (`{category?, limit}`; sin categoría = meta del total) / listar |
+| GET | /goals/progress | `?tz` avance del mes: gastado, lo que queda, %, estado, gasto diario sugerido y proyección |
+| PATCH/DELETE | /goals/:id | editar límite o categoría / borrar |
 
 Estados: `approved`, `declined`, `pending`, `refunded`.
 Listar admite `from,to,status,type,category,q,limit,offset`. Auth: `Authorization: Bearer <token>`.
+
+## Reportes y metas
+- **Zona horaria:** los pagos se guardan en UTC. Los reportes y las metas agrupan por día con la zona que envíe el cliente en `?tz=` (por defecto `DEFAULT_TZ`, `America/Bogota`), así un pago a las 10:30 p. m. no cae en el día siguiente.
+- Solo cuentan los gastos `approved` y `pending`; las declinadas y reembolsadas no suman.
+- **Metas:** el límite y la categoría van cifrados igual que las transacciones (tabla `goals`). Una meta por categoría; sin categoría es la meta del total del mes. Se repiten cada mes.
+- **Estado de una meta:** `ok` hasta 80 %, `warning` de 80 % a 100 %, `exceeded` al llegar al límite. `daily_allowance` = lo que queda ÷ días que faltan (contando hoy). `projected` = ritmo actual proyectado al fin de mes.
+- La tabla `goals` se crea sola al arrancar: los usuarios y gastos existentes no se tocan.
 
 ## Atajo de iOS
 Acción "Obtener contenido de URL": POST a `https://TU_API/v1/ingest`, encabezado

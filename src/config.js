@@ -16,6 +16,9 @@ export function loadConfig(env = process.env) {
     authRateMax: Number(env.AUTH_RATE_MAX || 20),
     accessTtlSec: 60 * 60, // 1 hora
     refreshTtlSec: 30 * 24 * 60 * 60, // 30 días
+    mfaTtlSec: 10 * 60, // tiempo para escanear el QR o escribir el código
+    mfaMaxAttempts: 5, // códigos incorrectos antes de anular el mfaToken
+    mfaIssuer: env.MFA_ISSUER || 'Gastos', // nombre que muestra la app Authenticator
     trustProxy: env.TRUST_PROXY === '1',
     corsOrigins: (env.CORS_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
   };

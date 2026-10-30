@@ -2,6 +2,23 @@ import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
 
+// Sesiones (access/refresh), tokens de ingesta del Atajo y tokens temporales de MFA.
+// El secreto del token nunca se guarda; solo la DEK envuelta con él.
+const CREDENTIALS = `
+    CREATE TABLE IF NOT EXISTS credentials (
+      id           TEXT PRIMARY KEY,
+      user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      kind         TEXT NOT NULL CHECK (kind IN ('access','refresh','ingest','mfa')),
+      label_enc    BLOB,
+      wrapped_dek  BLOB NOT NULL,
+      created_at   INTEGER NOT NULL,
+      expires_at   INTEGER,
+      revoked_at   INTEGER,
+      last_used_at INTEGER,
+      attempts     INTEGER NOT NULL DEFAULT 0  -- códigos MFA fallidos con este token
+    );
+    CREATE INDEX IF NOT EXISTS idx_cred_user ON credentials(user_id);`;
+
 export function openDb(file) {
   if (file !== ':memory:') fs.mkdirSync(path.dirname(file), { recursive: true });
   const db = new Database(file);
@@ -15,23 +32,12 @@ export function openDb(file) {
       kdf_n           INTEGER NOT NULL,
       wrapped_dek_pw  BLOB NOT NULL,          -- DEK cifrada con llave derivada de la contraseña
       wrapped_dek_rec BLOB NOT NULL,          -- DEK cifrada con la llave de recuperación
-      created_at      INTEGER NOT NULL
+      created_at      INTEGER NOT NULL,
+      totp_enc        BLOB,                   -- secreto del Authenticator cifrado con la DEK
+      totp_enabled_at INTEGER,                -- NULL = aún no confirmó el QR
+      totp_last_step  INTEGER                 -- último paso usado (anti-reuso de códigos)
     );
-
-    -- Sesiones (access/refresh) y tokens de ingesta del Atajo.
-    -- El secreto del token nunca se guarda; solo la DEK envuelta con él.
-    CREATE TABLE IF NOT EXISTS credentials (
-      id           TEXT PRIMARY KEY,
-      user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      kind         TEXT NOT NULL CHECK (kind IN ('access','refresh','ingest')),
-      label_enc    BLOB,
-      wrapped_dek  BLOB NOT NULL,
-      created_at   INTEGER NOT NULL,
-      expires_at   INTEGER,
-      revoked_at   INTEGER,
-      last_used_at INTEGER
-    );
-    CREATE INDEX IF NOT EXISTS idx_cred_user ON credentials(user_id);
+${CREDENTIALS}
 
     -- Todo el contenido de la transacción va dentro de "data" (cifrado).
     CREATE TABLE IF NOT EXISTS transactions (
@@ -49,5 +55,27 @@ export function openDb(file) {
     );
     CREATE INDEX IF NOT EXISTS idx_goals_user ON goals(user_id);
   `);
+  migrate(db);
   return db;
+}
+
+/** Lleva una base creada antes del MFA al esquema actual sin perder datos. */
+function migrate(db) {
+  const userCols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+  for (const [col, type] of [['totp_enc', 'BLOB'], ['totp_enabled_at', 'INTEGER'], ['totp_last_step', 'INTEGER']]) {
+    if (!userCols.includes(col)) db.exec(`ALTER TABLE users ADD COLUMN ${col} ${type}`);
+  }
+
+  // SQLite no permite cambiar un CHECK: se reconstruye la tabla copiando las filas.
+  const { sql } = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='credentials'").get();
+  if (!sql.includes("'mfa'")) {
+    const cols = 'id,user_id,kind,label_enc,wrapped_dek,created_at,expires_at,revoked_at,last_used_at';
+    db.transaction(() => {
+      db.exec(`ALTER TABLE credentials RENAME TO credentials_old;
+        ${CREDENTIALS}
+        INSERT INTO credentials (${cols}) SELECT ${cols} FROM credentials_old;
+        DROP TABLE credentials_old;
+        CREATE INDEX IF NOT EXISTS idx_cred_user ON credentials(user_id);`);
+    })();
+  }
 }

@@ -7,6 +7,8 @@ import { loadConfig } from '../src/config.js';
 import { openDb } from '../src/db.js';
 import { createApp } from '../src/app.js';
 import { parseAmount } from '../src/amount.js';
+import { base32Decode } from '../src/totp.js';
+import { registerWithMfa, totpFor } from './helpers.js';
 
 const PEPPER = 'a'.repeat(64);
 const env = { PEPPER, SCRYPT_N: '1024', AUTH_RATE_MAX: '1000' };
@@ -22,11 +24,7 @@ const api = async (method, url, body, token) => {
   return { status: res.status, body: text ? JSON.parse(text) : null };
 };
 
-const register = async (email, password = 'una-clave-larga-123') => {
-  const r = await api('POST', '/v1/auth/register', { email, password });
-  assert.equal(r.status, 201);
-  return r.body;
-};
+const register = (email, password) => registerWithMfa(api, email, password);
 
 before(async () => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gastos-'));
@@ -50,10 +48,14 @@ test('parseAmount entiende formatos colombianos y anglosajones', () => {
 });
 
 test('registro, login y contraseña incorrecta', async () => {
-  await register('ana@test.com');
+  const { totpSecret } = await register('ana@test.com');
   const ok = await api('POST', '/v1/auth/login', { email: 'ANA@test.com', password: 'una-clave-larga-123' });
   assert.equal(ok.status, 200);
-  assert.ok(ok.body.accessToken);
+  assert.equal(ok.body.mfaRequired, true);
+  assert.equal(ok.body.accessToken, undefined);
+  const mfa = await api('POST', '/v1/auth/login/mfa', { mfaToken: ok.body.mfaToken, code: totpFor(totpSecret, 1) });
+  assert.equal(mfa.status, 200);
+  assert.ok(mfa.body.accessToken);
   const bad = await api('POST', '/v1/auth/login', { email: 'ana@test.com', password: 'otra-clave-123456' });
   assert.equal(bad.status, 401);
   const ghost = await api('POST', '/v1/auth/login', { email: 'nadie@test.com', password: 'otra-clave-123456' });
@@ -129,13 +131,15 @@ test('aislamiento: un usuario no ve ni toca datos de otro', async () => {
 });
 
 test('DUMP: la base de datos no contiene ningún dato en claro', async () => {
-  const { accessToken: t } = await register('dump-victima@test.com', 'clave-super-secreta-999');
+  const { accessToken: t, totpSecret } = await register('dump-victima@test.com', 'clave-super-secreta-999');
   const secrets = ['Comercio-Ultra-Secreto-777', 'descripcion-privada-xyz', 'Visa 9876', 'dump-victima@test.com'];
   await api('POST', '/v1/transactions', {
     merchant: secrets[0], description: secrets[1], card: secrets[2], amount: 123456, category: 'categoria-privada',
   }, t);
   const tok = await api('POST', '/v1/ingest-tokens', { label: 'etiqueta-privada-zzz' }, t);
-  secrets.push('categoria-privada', 'etiqueta-privada-zzz', 'clave-super-secreta-999', tok.body.token.split('.')[1]);
+  secrets.push('categoria-privada', 'etiqueta-privada-zzz', 'clave-super-secreta-999', tok.body.token.split('.')[1], totpSecret);
+  // El secreto TOTP en bytes tampoco debe aparecer.
+  const totpRaw = base32Decode(totpSecret);
 
   db.pragma('wal_checkpoint(TRUNCATE)');
   const raw = fs.readFileSync(dbFile);
@@ -154,6 +158,7 @@ test('DUMP: la base de datos no contiene ningún dato en claro', async () => {
     assert.ok(!cells.includes(Buffer.from(s).toString('base64')), `base64 de "${s}"`);
   }
   assert.ok(!cells.includes('123456'), 'el monto aparece en claro');
+  assert.ok(!raw.includes(totpRaw), 'el secreto TOTP aparece en claro');
 });
 
 test('integridad: mover/alterar un blob cifrado se detecta', async () => {
@@ -196,7 +201,13 @@ test('refresh rota tokens; cambiar contraseña y recuperar conservan los datos',
   const rec = await api('POST', '/v1/auth/recover',
     { email: 'rot@test.com', recoveryKey: reg.recoveryKey, newPassword: 'clave-recuperada-89' });
   assert.equal(rec.status, 200);
-  const list = await api('GET', '/v1/transactions', null, rec.body.accessToken);
+  // Recuperar obliga a escanear un QR nuevo antes de tener sesión.
+  assert.equal(rec.body.mfaSetupRequired, true);
+  assert.equal(rec.body.accessToken, undefined);
+  const conf = await api('POST', '/v1/auth/mfa/setup/confirm',
+    { mfaToken: rec.body.mfaToken, code: totpFor(rec.body.mfaSetup.secret) });
+  assert.equal(conf.status, 200);
+  const list = await api('GET', '/v1/transactions', null, conf.body.accessToken);
   assert.equal(list.body.items[0].merchant, 'Persistente');
   // la llave de recuperación vieja ya no sirve
   const again = await api('POST', '/v1/auth/recover',

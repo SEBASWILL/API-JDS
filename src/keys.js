@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { encrypt, decrypt, hkdf, deriveFromPassword, randomKey, randomSalt } from './crypto.js';
 
-const PREFIX = { access: 'at_', refresh: 'rt_', ingest: 'it_' };
+const PREFIX = { access: 'at_', refresh: 'rt_', ingest: 'it_', mfa: 'mt_' };
 const pwAad = (userId) => `user:${userId}:pw`;
 const recAad = (userId) => `user:${userId}:rec`;
 
@@ -109,8 +109,14 @@ export const revokeCredential = (db, id) =>
   db.prepare('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL').run(Date.now(), id);
 
 export const revokeAllSessions = (db, userId) =>
-  db.prepare(`UPDATE credentials SET revoked_at = ? WHERE user_id = ? AND kind IN ('access','refresh') AND revoked_at IS NULL`)
+  db.prepare(`UPDATE credentials SET revoked_at = ? WHERE user_id = ? AND kind IN ('access','refresh','mfa') AND revoked_at IS NULL`)
     .run(Date.now(), userId);
 
-export const decryptLabel = (row, dek) =>
+/** Suma un intento fallido al mfaToken y lo anula al llegar al máximo. */
+export function failMfaAttempt(db, id, max) {
+  const { attempts } = db.prepare('UPDATE credentials SET attempts = attempts + 1 WHERE id = ? RETURNING attempts').get(id);
+  if (attempts >= max) revokeCredential(db, id);
+}
+
+export const decryptLabel =(row, dek) =>
   row.label_enc ? decrypt(dek, row.label_enc, `label:${row.id}`).toString() : null;

@@ -5,6 +5,20 @@ import assert from 'node:assert/strict';
 import { loadConfig } from '../src/config.js';
 import { openDb } from '../src/db.js';
 import { createApp } from '../src/app.js';
+import { base32Decode, totpCode, currentStep } from '../src/totp.js';
+
+/** Lo que mostraría el Authenticator para ese secreto (offset en pasos de 30 s). */
+export const totpFor = (secretB32, offset = 0) => totpCode(base32Decode(secretB32), currentStep() + offset);
+
+/** Registro completo: crea la cuenta y confirma el QR. Devuelve registro + sesión + secreto TOTP. */
+export async function registerWithMfa(api, email, password = 'una-clave-larga-123') {
+  const r = await api('POST', '/v1/auth/register', { email, password });
+  assert.equal(r.status, 201);
+  const { secret } = r.body.mfaSetup;
+  const c = await api('POST', '/v1/auth/mfa/setup/confirm', { mfaToken: r.body.mfaToken, code: totpFor(secret) });
+  assert.equal(c.status, 200);
+  return { ...r.body, ...c.body, totpSecret: secret };
+}
 
 export async function startServer(extraEnv = {}) {
   const env = { PEPPER: 'a'.repeat(64), SCRYPT_N: '1024', AUTH_RATE_MAX: '1000', ...extraEnv };
@@ -24,11 +38,7 @@ export async function startServer(extraEnv = {}) {
     const text = await res.text();
     return { status: res.status, body: text ? JSON.parse(text) : null };
   };
-  const register = async (email, password = 'una-clave-larga-123') => {
-    const r = await api('POST', '/v1/auth/register', { email, password });
-    assert.equal(r.status, 201);
-    return r.body;
-  };
+  const register = (email, password) => registerWithMfa(api, email, password);
   const stop = () => { server.close(); db.close(); fs.rmSync(dir, { recursive: true, force: true }); };
   return { api, register, db, dbFile, stop };
 }

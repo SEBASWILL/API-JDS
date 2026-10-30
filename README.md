@@ -7,7 +7,7 @@ va cifrado; en la base de datos solo hay IDs y bytes aleatorios.
 ```bash
 npm install
 cp .env.example .env        # y pon PEPPER=$(openssl rand -hex 32)
-npm test                    # 18 pruebas, incluidas las del dump de la BD
+npm test                    # 25 pruebas, incluidas las del dump de la BD y las del MFA
 npm run dev
 ```
 **PEPPER**: guárdalo fuera de la base de datos (variable de entorno del servidor / gestor de secretos).
@@ -23,6 +23,7 @@ Si lo pierdes, nadie puede iniciar sesión; si se filtra junto con la BD, pierde
   | Contraseña | scrypt(HMAC(PEPPER, contraseña)) |
   | Recuperación | llave aleatoria de 256 bits, mostrada una vez al registrarse |
   | Sesión (access/refresh) | secreto aleatorio del token (no se guarda) |
+| MFA pendiente (`mfaToken`) | secreto aleatorio del token, vive 10 min |
   | Ingesta (Atajo) | secreto aleatorio del token (no se guarda) |
 
 - El correo no se guarda: solo HMAC(PEPPER, correo).
@@ -31,12 +32,14 @@ Si lo pierdes, nadie puede iniciar sesión; si se filtra junto con la BD, pierde
 ## Endpoints (todos bajo /v1)
 | Método | Ruta | Descripción |
 |---|---|---|
-| POST | /auth/register | `{email,password}` → tokens + `recoveryKey` (una sola vez) |
-| POST | /auth/login | `{email,password}` → tokens |
+| POST | /auth/register | `{email,password}` → `recoveryKey` (una sola vez) + `mfaToken` + QR. **Sin sesión.** |
+| POST | /auth/mfa/setup/confirm | `{mfaToken,code}` → tokens (confirma que escaneó el QR) |
+| POST | /auth/login | `{email,password}` → `{mfaRequired, mfaToken}` (o `mfaSetupRequired` + QR si no tiene MFA) |
+| POST | /auth/login/mfa | `{mfaToken,code}` → tokens |
 | POST | /auth/refresh | `{refreshToken}` → tokens nuevos (rotación) |
 | POST | /auth/logout | `{all?}` |
 | POST | /auth/change-password | `{currentPassword,newPassword}` |
-| POST | /auth/recover | `{email,recoveryKey,newPassword}` |
+| POST | /auth/recover | `{email,recoveryKey,newPassword}` → `recoveryKey` nueva + QR nuevo (hay que confirmarlo) |
 | POST/GET/DELETE | /ingest-tokens | tokens para el Atajo (solo pueden crear transacciones) |
 | POST | /ingest | lo llama el Atajo: `{merchant,amount,card,date,status?}` |
 | POST/GET | /transactions | crear (tarjeta o `type:"cash"`) / listar con filtros |
@@ -50,6 +53,26 @@ Si lo pierdes, nadie puede iniciar sesión; si se filtra junto con la BD, pierde
 
 Estados: `approved`, `declined`, `pending`, `refunded`.
 Listar admite `from,to,status,type,category,q,limit,offset`. Auth: `Authorization: Bearer <token>`.
+
+## MFA (Microsoft Authenticator / Google Authenticator)
+Obligatorio para todos. Es TOTP estándar (RFC 6238, códigos de 6 dígitos cada 30 s), así que sirve
+cualquier app de autenticación; no hay que integrarse con Microsoft.
+
+**Registro:** `POST /auth/register` responde
+`{ user, recoveryKey, mfaSetupRequired: true, mfaToken, mfaSetup: { qrCode, otpauthUrl, secret } }`.
+La app muestra `qrCode` (imagen PNG en `data:` URL, va directo en un `<img src>`) y el `secret` para quien
+no pueda escanear. El usuario escribe el código → `POST /auth/mfa/setup/confirm` → sesión.
+
+**Login:** `POST /auth/login` → `{ user, mfaRequired: true, mfaToken }` → el usuario escribe el código →
+`POST /auth/login/mfa` → `{ user, accessToken, refreshToken, expiresIn }` (mismo formato de siempre).
+Si la cuenta aún no tiene MFA, el login responde como el registro (`mfaSetupRequired` + QR).
+
+- El `mfaToken` dura 10 minutos, es de un solo uso y se anula tras 5 códigos incorrectos. No sirve como token de acceso.
+- Un código ya usado no se acepta otra vez; se tolera ±30 s de desfase de reloj.
+- El secreto TOTP se guarda cifrado con la DEK del usuario (no aparece en un dump).
+- `/refresh`, el resto de endpoints y los tokens de ingesta del Atajo **no** piden código.
+- **Perdió el celular:** `/auth/recover` con la llave de recuperación cambia la contraseña y obliga a escanear un QR nuevo.
+- `MFA_ISSUER` (opcional, por defecto `Gastos`) es el nombre que muestra la app Authenticator.
 
 ## Reportes y metas
 - **Zona horaria:** los pagos se guardan en UTC. Los reportes y las metas agrupan por día con la zona que envíe el cliente en `?tz=` (por defecto `DEFAULT_TZ`, `America/Bogota`), así un pago a las 10:30 p. m. no cae en el día siguiente.

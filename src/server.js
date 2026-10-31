@@ -4,4 +4,6 @@ import { createApp } from './app.js';
 
 const config = loadConfig();
 const db = openDb(config.dbPath);
-createApp(db, config).listen(config.port, () => console.log(`API en http://localhost:${config.port}`));
+createApp(db, config).listen(config.port, '0.0.0.0', () => {
+  console.log(`API en http://localhost:${config.port}`);
+});

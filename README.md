@@ -1,7 +1,7 @@
 # Gastos API
 
-API en Node.js (Express + SQLite) para registrar gastos con cifrado por usuario y MFA obligatorio
-(Microsoft Authenticator, Google Authenticator o cualquier app TOTP). Todo el contenido financiero va
+API en Node.js (Express + SQLite) para registrar gastos con cifrado por usuario, verificación de correo
+y MFA obligatorio (Microsoft Authenticator, Google Authenticator o cualquier app TOTP). Todo el contenido financiero va
 cifrado; en la base de datos solo hay IDs y bytes aleatorios.
 
 **Contenido**
@@ -23,7 +23,7 @@ Requiere Node.js 20.6 o superior (usa `--env-file`). Probado con Node 24.
 ```bash
 npm install
 # crea .env con al menos PEPPER (ver tabla de abajo)
-npm test        # 25 pruebas: API, dump de la BD, reportes, metas y MFA
+npm test        # 33 pruebas: API, dump de la BD, reportes, metas, MFA y verificación de correo
 npm run dev     # recarga al guardar
 npm start       # producción
 ```
@@ -39,13 +39,24 @@ npm start       # producción
 | `TRUST_PROXY` | no | — | `1` si la API está detrás de un proxy (nginx, Render, etc.) para que el límite de intentos use la IP real. |
 | `AUTH_RATE_MAX` | no | `20` | Peticiones por IP cada 15 min a **todas** las rutas `/v1/auth/*`. |
 | `DEFAULT_TZ` | no | `America/Bogota` | Zona horaria de reportes y metas cuando el cliente no envía `?tz=`. |
-| `MFA_ISSUER` | no | `Gastos` | Nombre que muestra la app Authenticator junto al correo. |
+| `MFA_ISSUER` | no | `Gastos` | Nombre que muestra la app Authenticator junto al correo (también va en el asunto del correo). |
+| `GMAIL_USER` | en producción | — | Cuenta de Gmail que envía los códigos, ej. `gastos.app@gmail.com`. |
+| `GMAIL_APP_PASSWORD` | en producción | — | Contraseña de aplicación de esa cuenta (16 letras; los espacios se ignoran). |
+| `MAIL_FROM` | no | `<MFA_ISSUER> <GMAIL_USER>` | Remitente que ve el usuario. Con Gmail debe ser la misma cuenta o un alias verificado. |
+| `EMAIL_RESEND_COOLDOWN_SEC` | no | `60` | Segundos mínimos entre dos reenvíos del código al mismo correo. |
 | `SCRYPT_N` | no | `32768` | Costo de scrypt al derivar la contraseña. No lo bajes en producción. |
 
 **PEPPER**: guárdalo fuera de la base de datos (variable de entorno del servidor o gestor de secretos).
 Si lo pierdes, nadie puede iniciar sesión; si se filtra junto con la BD, pierdes esa capa extra.
 
-Al arrancar, la API crea las tablas que falten y migra una base anterior sin perder datos.
+**Correo con Gmail**: en la cuenta de Google que enviará los correos, activa la verificación en dos pasos
+y crea una contraseña de aplicación en <https://myaccount.google.com/apppasswords>. Pon el correo en
+`GMAIL_USER` y la contraseña generada en `GMAIL_APP_PASSWORD`. Si faltan las dos variables (desarrollo),
+la API no envía nada y **escribe el código en la consola** del servidor. Gmail gratuito permite unos
+500 envíos al día; para más volumen conviene un servicio transaccional (SES, Resend, etc.).
+
+Al arrancar, la API crea las tablas que falten y migra una base anterior sin perder datos. Las cuentas
+que ya existían antes de la verificación de correo quedan marcadas como verificadas.
 
 ---
 
@@ -63,34 +74,47 @@ Todos los tokens tienen la forma `<prefijo>_<id>.<secreto>` y deben tratarse com
 |---|---|---|---|---|
 | `accessToken` | `at_` | 1 hora (`expiresIn: 3600`) | Llamar a todas las rutas protegidas. | `login/mfa`, `mfa/setup/confirm`, `refresh`, `change-password` |
 | `refreshToken` | `rt_` | 30 días | Pedir un par nuevo cuando el access vence. **Un solo uso.** | Junto con el `accessToken` |
-| `mfaToken` | `mt_` | 10 min | Puente entre "contraseña correcta" y "código del Authenticator". **Un solo uso**, se anula tras 5 códigos incorrectos. No sirve en ninguna otra ruta. | `register`, `login`, `recover` |
+| `mfaToken` | `mt_` | 10 min | Puente entre "contraseña correcta" y "código del Authenticator". **Un solo uso**, se anula tras 5 códigos incorrectos. No sirve en ninguna otra ruta. | `login`, `recover` (solo con el correo verificado) |
 | Token de ingesta | `it_` | No vence (hasta revocarlo) | Solo `POST /v1/ingest` (Atajo de iOS). No puede leer nada. | `POST /v1/ingest-tokens` |
 
 Reglas importantes:
 
-- **Nunca hay sesión sin MFA.** Registro, login y recuperación devuelven solo un `mfaToken`; la sesión
+- **Primero se verifica el correo.** El registro envía un código de 6 dígitos al correo; mientras no se
+  confirme con `/auth/verify-email`, el login responde `403` y no entrega `mfaToken` ni QR.
+- **Nunca hay sesión sin MFA.** Login y recuperación devuelven solo un `mfaToken`; la sesión
   (`accessToken` + `refreshToken`) llega después de enviar un código válido del Authenticator.
 - El código es de **6 dígitos** y cambia cada 30 s. Se aceptan espacios (`"123 456"`). Se tolera ±30 s
   de desfase de reloj. **Un código ya usado no se acepta otra vez**, aunque siga vigente.
 - `/refresh`, las rutas de datos y los tokens de ingesta **no** piden código.
 - El límite de `AUTH_RATE_MAX` (20 por defecto) cuenta **todas** las rutas `/v1/auth/*` juntas,
-  incluido `/refresh`. Al pasarlo, la API responde `429`.
+  incluido `/refresh`. Al pasarlo, la API responde `429` con `{ "error": "...", "retryAfterSec": 540 }`.
 
 ---
 
 ## Flujos paso a paso
 
-### 1. Registro (obligatorio escanear el QR)
+### 1. Registro (verificar el correo y luego escanear el QR)
 
 ```
 App                                   API
  │ POST /v1/auth/register              │
- │ { email, password }  ──────────────▶│
- │◀──── 201 { recoveryKey, mfaToken,   │
- │            mfaSetup: { qrCode, … } }│
+ │ { email, password }  ──────────────▶│──▶ correo con código de 6 dígitos
+ │◀──── 201 { recoveryKey,             │
+ │     emailVerificationRequired,      │
+ │     emailSent }                     │
  │                                     │
- │ (muestra la llave de recuperación y el QR;
- │  el usuario escanea y escribe el código)
+ │ (muestra la llave de recuperación y pide el código del correo)
+ │                                     │
+ │ POST /v1/auth/verify-email          │
+ │ { email, code }  ──────────────────▶│
+ │◀──── 200 { verified: true }         │
+ │                                     │
+ │ POST /v1/auth/login                 │
+ │ { email, password }  ──────────────▶│
+ │◀──── 200 { mfaSetupRequired,        │
+ │            mfaToken, mfaSetup }     │
+ │                                     │
+ │ (muestra el QR; el usuario escanea y escribe el código del Authenticator)
  │                                     │
  │ POST /v1/auth/mfa/setup/confirm     │
  │ { mfaToken, code }  ───────────────▶│
@@ -100,13 +124,17 @@ App                                   API
 
 1. Mostrar `recoveryKey` y pedir que la guarde: **no se vuelve a mostrar** y es la única forma de
    recuperar la cuenta si olvida la contraseña o pierde el celular.
-2. Mostrar `mfaSetup.qrCode` en un `<img src="...">` (ya es una `data:` URL PNG). Mostrar también
+2. Pedir el código que llegó al correo → `POST /v1/auth/verify-email`. El código **vence en 10 min** y
+   se anula tras **5 intentos fallidos**; en ambos casos se pide otro con `POST /v1/auth/resend-code`
+   (que anula el anterior). Si `emailSent` vino en `false`, el correo no salió: ofrecer "reenviar".
+3. Con el correo verificado, hacer `POST /v1/auth/login` con la misma contraseña (la app la tiene aún
+   en memoria): como el MFA no está activo, responde con el QR.
+4. Mostrar `mfaSetup.qrCode` en un `<img src="...">` (ya es una `data:` URL PNG). Mostrar también
    `mfaSetup.secret` para quien no pueda escanear (se escribe a mano en la app como "clave de configuración").
    En el celular, `mfaSetup.otpauthUrl` como enlace abre la app Authenticator directamente.
-3. El usuario escribe el código → `POST /v1/auth/mfa/setup/confirm`. Si el código está mal (`401`)
+5. El usuario escribe el código → `POST /v1/auth/mfa/setup/confirm`. Si el código está mal (`401`)
    puede reintentar con el mismo `mfaToken` hasta 5 veces o hasta que pasen 10 min.
-4. Si el `mfaToken` vence antes de confirmar, el usuario hace login normal: como su MFA no está
-   activo, el login le devuelve un QR nuevo (paso siguiente).
+6. Si el `mfaToken` vence antes de confirmar, basta con hacer login otra vez: devuelve un QR nuevo.
 
 ### 2. Login
 
@@ -120,6 +148,9 @@ POST /v1/auth/login { email, password }
   │     (la cuenta no terminó de configurar el MFA: mostrar QR como en el registro)
   │     POST /v1/auth/mfa/setup/confirm { mfaToken, code }
   │       └─ 200 { accessToken, refreshToken, expiresIn }
+  │
+  ├─ 403 { emailVerificationRequired: true }
+  │     (correo sin verificar: pedir el código, /auth/verify-email y volver a /login)
   │
   └─ 401 Credenciales inválidas
 ```
@@ -153,8 +184,9 @@ dispositivo actual. El MFA no cambia.
 - Cambia la contraseña, genera una **llave de recuperación nueva** (la anterior deja de servir) y
   **reinicia el MFA**: el Authenticator viejo deja de funcionar.
 - Cierra todas las sesiones.
-- Responde igual que el registro (`recoveryKey` + QR + `mfaToken`) → confirmar con
-  `POST /v1/auth/mfa/setup/confirm`.
+- Responde `recoveryKey` + QR + `mfaToken` → confirmar con `POST /v1/auth/mfa/setup/confirm`.
+- Si el correo aún no estaba verificado, cambia la contraseña igual pero responde
+  `{ recoveryKey, emailVerificationRequired: true }` sin QR: verificar el correo y luego hacer login.
 
 ### 7. Atajo de iOS (Apple Pay)
 
@@ -178,7 +210,14 @@ const post = (path, body, token) => fetch(API + path, {
 }).then(async (r) => ({ status: r.status, body: r.status === 204 ? null : await r.json() }));
 
 // Paso 1: contraseña
-const step1 = await post('/auth/login', { email, password });
+let step1 = await post('/auth/login', { email, password });
+if (step1.status === 403 && step1.body.emailVerificationRequired) {
+  // Cuenta sin verificar: pedir el código del correo (o reenviarlo con /auth/resend-code).
+  const emailCode = await pedirCodigoDelCorreo();
+  const v = await post('/auth/verify-email', { email, code: emailCode });
+  if (v.status !== 200) throw new Error(v.body.error);
+  step1 = await post('/auth/login', { email, password });
+}
 if (step1.status !== 200) throw new Error(step1.body.error);
 
 let session;
@@ -221,9 +260,22 @@ interface MfaSetup {
   secret: string;                                   // base32 (A-Z, 2-7), para escribirlo a mano
 }
 
-interface MfaSetupRequired {                        // register (201), login sin MFA (200), recover (200)
+interface Registered {                              // register (201)
   user: User;
-  recoveryKey?: string;                             // solo register y recover: "xxxxxxxx-xxxxxxxx-..." (8 grupos hex)
+  recoveryKey: string;                              // "xxxxxxxx-xxxxxxxx-..." (8 grupos hex), se muestra UNA vez
+  emailVerificationRequired: true;
+  emailSent: boolean;                               // false = el correo no salió: ofrecer /auth/resend-code
+}
+
+interface EmailVerificationRequired {               // recover (200) con el correo sin verificar
+  user: User;
+  recoveryKey: string;                              // la nueva
+  emailVerificationRequired: true;
+}
+
+interface MfaSetupRequired {                        // login sin MFA (200), recover (200)
+  user: User;
+  recoveryKey?: string;                             // solo recover: "xxxxxxxx-xxxxxxxx-..." (8 grupos hex)
   mfaSetupRequired: true;
   mfaToken: string;                                 // "mt_xxxx.yyyy"
   mfaSetup: MfaSetup;
@@ -266,6 +318,9 @@ interface Goal {
 interface ApiError {
   error: string;                                    // mensaje en español, apto para mostrar
   details?: { field: string; message: string }[];   // solo en 400 de validación
+  retryAfterSec?: number;                           // solo en 429: segundos para volver a intentar
+  attemptsLeft?: number;                            // solo en 401 de /auth/verify-email
+  emailVerificationRequired?: true;                 // solo en 403 de /auth/login
 }
 ```
 
@@ -287,18 +342,20 @@ Se aceptan como número o como texto. El texto se interpreta así:
 
 ## Errores
 
-Todas las respuestas de error son JSON con la forma `ApiError`, salvo el `429`.
+Todas las respuestas de error son JSON con la forma `ApiError`, incluido el `429`.
 
 | Código | Cuándo | Cuerpo |
 |---|---|---|
 | `400` | Datos inválidos (campo faltante, tipo incorrecto, campo no permitido) | `{ "error": "Datos inválidos", "details": [{ "field": "amount", "message": "monto inválido" }] }` |
 | `400` | El cuerpo no es JSON válido | `{ "error": "JSON inválido" }` |
 | `401` | Falta el token, está vencido, revocado o es de otro tipo; credenciales o código MFA incorrectos | `{ "error": "No autorizado" }` (u otro mensaje según la ruta) |
+| `403` | Login con el correo sin verificar | `{ "error": "Primero verifica tu correo con el código que te enviamos", "emailVerificationRequired": true }` |
 | `404` | El recurso no existe **o es de otro usuario** (nunca se distingue) | `{ "error": "No encontrado" }` |
 | `404` | Ruta inexistente | `{ "error": "Ruta no encontrada" }` |
 | `409` | Conflicto (correo ya registrado, meta duplicada, paso de MFA equivocado) | `{ "error": "..." }` |
 | `413` | Cuerpo mayor a 20 KB | `{ "error": "Cuerpo demasiado grande" }` |
-| `429` | Demasiados intentos en `/v1/auth/*` | Texto plano `Too many requests, please try again later.` Los encabezados `RateLimit-*` indican cuándo reintentar. |
+| `429` | Demasiados intentos en `/v1/auth/*`, o reenvío del código antes de la espera | `{ "error": "Demasiados intentos: espera unos minutos y vuelve a intentarlo", "retryAfterSec": 540 }`. También vienen los encabezados `RateLimit-*`. |
+| `502` | Gmail no aceptó el correo en `/v1/auth/resend-code` | `{ "error": "No se pudo enviar el correo: inténtalo más tarde" }` |
 | `500` | Un dato cifrado fue alterado o movido | `{ "error": "Integridad de datos comprometida" }` |
 | `500` | Error inesperado | `{ "error": "Error interno" }` |
 
@@ -314,7 +371,9 @@ Leyenda de autenticación: **—** pública · **access** `accessToken` · **ing
 | Método | Ruta | Auth | Resumen |
 |---|---|---|---|
 | GET | `/health` | — | Estado del servidor |
-| POST | `/v1/auth/register` | — | Crear cuenta → QR |
+| POST | `/v1/auth/register` | — | Crear cuenta → código al correo |
+| POST | `/v1/auth/verify-email` | — | Confirmar el código del correo |
+| POST | `/v1/auth/resend-code` | — | Reenviar el código al correo |
 | POST | `/v1/auth/mfa/setup/confirm` | — (`mfaToken`) | Confirmar QR → sesión |
 | POST | `/v1/auth/login` | — | Contraseña → `mfaToken` |
 | POST | `/v1/auth/login/mfa` | — (`mfaToken`) | Código → sesión |
@@ -350,34 +409,59 @@ Leyenda de autenticación: **—** pública · **access** `accessToken` · **ing
 ### Autenticación
 
 #### `POST /v1/auth/register`
-Crea la cuenta. **No entrega sesión**: hay que confirmar el QR.
+Crea la cuenta y envía un código de 6 dígitos al correo. **No entrega sesión ni QR**: primero hay que
+verificar el correo y luego hacer login.
 
 ```ts
 // Request
 { email: string;      // correo válido, máx. 254
   password: string }  // 10 a 200 caracteres
 ```
-**201** `MfaSetupRequired` (incluye `recoveryKey`)
+**201** `Registered`
 ```json
 {
   "user": { "id": "3f6c1a2e-...-9b1d" },
   "recoveryKey": "1a2b3c4d-5e6f7a8b-...-9c0d1e2f",
-  "mfaSetupRequired": true,
-  "mfaToken": "mt_Qk3x....Zr8",
-  "mfaSetup": {
-    "qrCode": "data:image/png;base64,iVBORw0KGgo...",
-    "otpauthUrl": "otpauth://totp/Gastos%3Aana%40correo.com?secret=JBSWY3DP...&issuer=Gastos&algorithm=SHA1&digits=6&period=30",
-    "secret": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
-  }
+  "emailVerificationRequired": true,
+  "emailSent": true
 }
 ```
 Errores: `400` validación · `409` "Ese correo ya está registrado".
+
+#### `POST /v1/auth/verify-email`
+Confirma el código que llegó al correo.
+
+```ts
+{ email: string;
+  code: string }   // 6 dígitos; se ignoran los espacios
+```
+**200** `{ "verified": true }` (también si el correo ya estaba verificado).
+
+Errores:
+- `400` el código no tiene 6 dígitos
+- `400` "El código venció: pide uno nuevo" (pasaron 10 min)
+- `400` "Demasiados intentos fallidos: pide un código nuevo" (5 fallos)
+- `400` "No hay un código pendiente para ese correo: pide uno nuevo"
+- `401` "Código incorrecto" con `attemptsLeft` (intentos que le quedan a ese código)
+
+#### `POST /v1/auth/resend-code`
+Envía un código nuevo; el anterior deja de servir y los intentos vuelven a 5. Como el servidor no guarda
+el correo (solo su huella), hay que enviarlo en la petición.
+
+```ts
+{ email: string }
+```
+**200** `{ "message": "Si el correo está registrado y sin verificar, te enviamos un código nuevo" }`.
+La respuesta es la misma si el correo no existe o ya está verificado (no revela cuentas).
+
+Errores: `400` validación · `429` con `retryAfterSec` si no han pasado 60 s desde el último envío ·
+`502` si Gmail no aceptó el correo.
 
 #### `POST /v1/auth/mfa/setup/confirm`
 Confirma que el usuario escaneó el QR y activa el MFA.
 
 ```ts
-{ mfaToken: string;  // el de register, login (mfaSetupRequired) o recover
+{ mfaToken: string;  // el de login (mfaSetupRequired) o recover
   code: string }     // 6 dígitos; se ignoran los espacios
 ```
 **200** `Session` (con `user`)
@@ -408,7 +492,8 @@ Primer paso: valida la contraseña. **Nunca devuelve la sesión directamente.**
 → la cuenta no tiene el MFA activo: mostrar el QR y llamar a `/v1/auth/mfa/setup/confirm`.
 Cada vez que pasa esto se genera un QR nuevo y los anteriores sin confirmar dejan de servir.
 
-Errores: `400` validación · `401` "Credenciales inválidas" (no indica si el correo existe).
+Errores: `400` validación · `401` "Credenciales inválidas" (no indica si el correo existe) ·
+`403` con `emailVerificationRequired: true` si la contraseña es correcta pero el correo no está verificado.
 
 #### `POST /v1/auth/login/mfa`
 Segundo paso del login.
@@ -456,7 +541,8 @@ Errores: `400` validación · `401` "Contraseña actual incorrecta".
   newPassword: string }   // 10 a 200 caracteres
 ```
 **200** `MfaSetupRequired` (incluye la `recoveryKey` **nueva**). Hay que confirmar el QR nuevo con
-`/v1/auth/mfa/setup/confirm` para obtener sesión.
+`/v1/auth/mfa/setup/confirm` para obtener sesión. Si el correo no estaba verificado responde
+`EmailVerificationRequired` (con la `recoveryKey` nueva y sin QR).
 
 Errores: `400` validación · `401` "Datos de recuperación inválidos".
 
@@ -689,7 +775,9 @@ Query: `tz?`. Avance del mes en curso.
   | Ingesta (Atajo) | secreto aleatorio del token (no se guarda) |
 
 - El secreto del Authenticator (TOTP) se guarda cifrado con la DEK: no aparece en un dump.
-- El correo no se guarda: solo HMAC(PEPPER, correo).
+- El correo no se guarda: solo HMAC(PEPPER, correo). Por eso `/auth/resend-code` lo recibe en la petición.
+- El código del correo tampoco se guarda: solo HMAC(PEPPER, usuario + código), con su vencimiento y
+  el contador de intentos.
 - Cada usuario tiene una DEK distinta; con la de uno no se abre nada de otro.
 - El MFA es TOTP estándar (RFC 6238: SHA-1, 6 dígitos, 30 s), compatible con cualquier app de autenticación.
 

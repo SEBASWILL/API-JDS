@@ -8,8 +8,9 @@ import { transactionsRouter } from './routes/transactions.js';
 import { reportsRouter } from './routes/reports.js';
 import { goalsRouter } from './routes/goals.js';
 import { errorHandler } from './middleware.js';
+import { createMailer } from './mailer.js';
 
-export function createApp(db, config) {
+export function createApp(db, config, { mailer = createMailer(config) } = {}) {
   const app = express();
   if (config.trustProxy) app.set('trust proxy', 1);
   app.disable('x-powered-by');
@@ -22,7 +23,7 @@ export function createApp(db, config) {
   app.use(express.json({ limit: '20kb' }));
 
   app.get('/health', (_req, res) => res.json({ ok: true }));
-  app.use('/v1/auth', authRouter(db, config));
+  app.use('/v1/auth', authRouter(db, config, mailer));
   app.use('/v1/ingest-tokens', tokensRouter(db));
   app.use('/v1/ingest', ingestRouter(db));
   app.use('/v1/transactions', transactionsRouter(db));

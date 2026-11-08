@@ -8,10 +8,10 @@ import { openDb } from '../src/db.js';
 import { createApp } from '../src/app.js';
 import { parseAmount } from '../src/amount.js';
 import { base32Decode } from '../src/totp.js';
-import { registerWithMfa, totpFor } from './helpers.js';
+import { registerWithMfa, totpFor, mailer } from './helpers.js';
 
 const PEPPER = 'a'.repeat(64);
-const env = { PEPPER, SCRYPT_N: '1024', AUTH_RATE_MAX: '1000' };
+const env = { PEPPER, SCRYPT_N: '1024', AUTH_RATE_MAX: '1000', EMAIL_RESEND_COOLDOWN_SEC: '0' };
 let dir, dbFile, db, server, base;
 
 const api = async (method, url, body, token) => {
@@ -30,7 +30,7 @@ before(async () => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gastos-'));
   dbFile = path.join(dir, 'test.db');
   db = openDb(dbFile);
-  const app = createApp(db, loadConfig(env));
+  const app = createApp(db, loadConfig(env), { mailer });
   await new Promise((ok) => { server = app.listen(0, ok); });
   base = `http://127.0.0.1:${server.address().port}`;
 });
@@ -174,7 +174,7 @@ test('integridad: mover/alterar un blob cifrado se detecta', async () => {
 
 test('sin el PEPPER del servidor, un dump no permite iniciar sesión', async () => {
   await register('pepper@test.com', 'clave-con-pepper-123');
-  const other = createApp(db, loadConfig({ ...env, PEPPER: 'b'.repeat(64) }));
+  const other = createApp(db, loadConfig({ ...env, PEPPER: 'b'.repeat(64) }), { mailer });
   const s = await new Promise((ok) => { const x = other.listen(0, () => ok(x)); });
   const res = await fetch(`http://127.0.0.1:${s.address().port}/v1/auth/login`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },

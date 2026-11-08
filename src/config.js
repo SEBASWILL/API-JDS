@@ -19,6 +19,12 @@ export function loadConfig(env = process.env) {
     mfaTtlSec: 10 * 60, // tiempo para escanear el QR o escribir el código
     mfaMaxAttempts: 5, // códigos incorrectos antes de anular el mfaToken
     mfaIssuer: env.MFA_ISSUER || 'Gastos', // nombre que muestra la app Authenticator
+    emailCodeTtlSec: 10 * 60, // vigencia del código enviado al correo
+    emailCodeMaxAttempts: 5, // códigos incorrectos antes de anularlo
+    emailResendCooldownSec: Number(env.EMAIL_RESEND_COOLDOWN_SEC ?? 60), // espera mínima entre reenvíos
+    gmailUser: env.GMAIL_USER || '',
+    gmailAppPassword: (env.GMAIL_APP_PASSWORD || '').replace(/\s/g, ''), // Google la muestra con espacios
+    mailFrom: env.MAIL_FROM || '',
     trustProxy: env.TRUST_PROXY === '1',
     corsOrigins: (env.CORS_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
   };

@@ -6,7 +6,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { openDb } from '../src/db.js';
 import { totpCode, verifyTotp, base32Encode, base32Decode, currentStep } from '../src/totp.js';
-import { startServer, totpFor } from './helpers.js';
+import { startServer, totpFor, mailer } from './helpers.js';
 
 let s;
 before(async () => { s = await startServer(); });
@@ -30,18 +30,24 @@ test('TOTP: vectores del RFC 6238 y base32 de ida y vuelta', () => {
   assert.equal(verifyTotp(secret, totpCode(secret, step), step, now), null); // ya usado
 });
 
-test('registro: entrega QR y no da sesión hasta confirmar el código', async () => {
+test('registro: tras verificar el correo, el login entrega QR y no da sesión hasta confirmar', async () => {
   const r = await s.api('POST', '/v1/auth/register', { email: 'qr@test.com', password: PW });
   assert.equal(r.status, 201);
-  assert.equal(r.body.mfaSetupRequired, true);
-  assert.equal(r.body.accessToken, undefined);
+  assert.equal(r.body.emailVerificationRequired, true);
+  assert.equal(r.body.mfaToken, undefined);
+  assert.equal(r.body.mfaSetup, undefined);
   assert.ok(r.body.recoveryKey);
-  assert.match(r.body.mfaSetup.qrCode, /^data:image\/png;base64,/);
-  assert.match(r.body.mfaSetup.otpauthUrl, /^otpauth:\/\/totp\/Gastos%3Aqr%40test\.com\?secret=[A-Z2-7]+&issuer=Gastos/);
-  const { secret } = r.body.mfaSetup;
+  assert.equal((await s.api('POST', '/v1/auth/verify-email', { email: 'qr@test.com', code: mailer.lastCode('qr@test.com') })).status, 200);
+
+  const first = await s.api('POST', '/v1/auth/login', { email: 'qr@test.com', password: PW });
+  assert.equal(first.body.mfaSetupRequired, true);
+  assert.equal(first.body.accessToken, undefined);
+  assert.match(first.body.mfaSetup.qrCode, /^data:image\/png;base64,/);
+  assert.match(first.body.mfaSetup.otpauthUrl, /^otpauth:\/\/totp\/Gastos%3Aqr%40test\.com\?secret=[A-Z2-7]+&issuer=Gastos/);
+  const { secret } = first.body.mfaSetup;
 
   // El mfaToken no sirve como token de acceso.
-  assert.equal((await s.api('GET', '/v1/transactions', null, r.body.mfaToken)).status, 401);
+  assert.equal((await s.api('GET', '/v1/transactions', null, first.body.mfaToken)).status, 401);
 
   // Sin confirmar, el login vuelve a pedir configurar (QR nuevo).
   const l = await s.api('POST', '/v1/auth/login', { email: 'qr@test.com', password: PW });
@@ -126,6 +132,9 @@ test('migración: una base creada antes del MFA se actualiza sin perder credenci
   const db = openDb(file);
   const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
   assert.ok(cols.includes('totp_enc') && cols.includes('totp_enabled_at') && cols.includes('totp_last_step'));
+  assert.ok(cols.includes('email_verified_at') && cols.includes('email_code_hash'));
+  // Las cuentas que ya existían quedan como verificadas.
+  assert.equal(db.prepare('SELECT email_verified_at FROM users WHERE id = ?').get('u1').email_verified_at, 1);
   assert.equal(db.prepare('SELECT kind FROM credentials WHERE id = ?').get('it_x').kind, 'ingest');
   db.prepare("INSERT INTO credentials (id,user_id,kind,wrapped_dek,created_at) VALUES ('mt_x','u1','mfa',x'00',1)").run();
   assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'idx_cred_user'").get());

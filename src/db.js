@@ -35,7 +35,12 @@ export function openDb(file) {
       created_at      INTEGER NOT NULL,
       totp_enc        BLOB,                   -- secreto del Authenticator cifrado con la DEK
       totp_enabled_at INTEGER,                -- NULL = aún no confirmó el QR
-      totp_last_step  INTEGER                 -- último paso usado (anti-reuso de códigos)
+      totp_last_step  INTEGER,                -- último paso usado (anti-reuso de códigos)
+      email_verified_at INTEGER,              -- NULL = aún no confirmó el código del correo
+      email_code_hash   BLOB,                 -- HMAC del código de 6 dígitos (nunca el código)
+      email_code_expires_at INTEGER,
+      email_code_attempts   INTEGER NOT NULL DEFAULT 0,
+      email_code_sent_at    INTEGER
     );
 ${CREDENTIALS}
 
@@ -59,11 +64,22 @@ ${CREDENTIALS}
   return db;
 }
 
-/** Lleva una base creada antes del MFA al esquema actual sin perder datos. */
+/** Lleva una base creada antes del MFA o de la verificación de correo al esquema actual sin perder datos. */
 function migrate(db) {
   const userCols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
   for (const [col, type] of [['totp_enc', 'BLOB'], ['totp_enabled_at', 'INTEGER'], ['totp_last_step', 'INTEGER']]) {
     if (!userCols.includes(col)) db.exec(`ALTER TABLE users ADD COLUMN ${col} ${type}`);
+  }
+  if (!userCols.includes('email_verified_at')) {
+    db.transaction(() => {
+      db.exec(`ALTER TABLE users ADD COLUMN email_verified_at INTEGER;
+        ALTER TABLE users ADD COLUMN email_code_hash BLOB;
+        ALTER TABLE users ADD COLUMN email_code_expires_at INTEGER;
+        ALTER TABLE users ADD COLUMN email_code_attempts INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE users ADD COLUMN email_code_sent_at INTEGER;`);
+      // Las cuentas creadas antes de la verificación de correo se dan por verificadas.
+      db.exec('UPDATE users SET email_verified_at = created_at');
+    })();
   }
 
   // SQLite no permite cambiar un CHECK: se reconstruye la tabla copiando las filas.

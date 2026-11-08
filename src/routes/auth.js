@@ -8,22 +8,51 @@ import {
   createUserKeys, unlockWithPassword, unlockWithRecovery, rewrapPassword, newRecoveryKey,
   issueSession, issueCredential, authenticateToken, revokeCredential, revokeAllSessions, failMfaAttempt,
 } from '../keys.js';
+import { newEmailCode, hashEmailCode, sameHash } from '../emailCode.js';
 import { newTotpSecret, sealTotp, openTotp, verifyTotp, otpauthUrl, base32Encode } from '../totp.js';
 
 const password = z.string().min(10, 'mínimo 10 caracteres').max(200);
 const email = z.string().email().max(254);
-const mfaBody = z.object({
-  mfaToken: z.string().max(200),
-  code: z.string().max(20).transform((s) => s.replace(/\s/g, '')).pipe(z.string().regex(/^\d{6}$/, 'el código debe tener 6 dígitos')),
-}).strict();
+const sixDigits = z.string().max(20).transform((s) => s.replace(/\s/g, ''))
+  .pipe(z.string().regex(/^\d{6}$/, 'el código debe tener 6 dígitos'));
+const mfaBody = z.object({ mfaToken: z.string().max(200), code: sixDigits }).strict();
 
-export function authRouter(db, config) {
+export function authRouter(db, config, mailer) {
   const r = Router();
-  const limiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: config.authRateMax, standardHeaders: true, legacyHeaders: false });
+  const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: config.authRateMax,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => {
+      const reset = req.rateLimit?.resetTime;
+      const retryAfterSec = reset ? Math.max(1, Math.ceil((reset.getTime() - Date.now()) / 1000)) : undefined;
+      res.status(429).json({ error: 'Demasiados intentos: espera unos minutos y vuelve a intentarlo', retryAfterSec });
+    },
+  });
   r.use(limiter);
 
   const findUser = (e) => db.prepare('SELECT * FROM users WHERE email_lookup = ?').get(emailLookup(e, config.pepper));
   const issueMfaToken = (userId, dek) => issueCredential(db, { userId, dek, kind: 'mfa', ttlSec: config.mfaTtlSec });
+
+  /** Genera un código nuevo (anula el anterior), guarda solo su HMAC y lo envía. Devuelve si se envió. */
+  async function sendEmailCode(userId, to) {
+    const code = newEmailCode();
+    const now = Date.now();
+    db.prepare(`UPDATE users SET email_code_hash=?, email_code_expires_at=?, email_code_attempts=0, email_code_sent_at=?
+                WHERE id=?`).run(hashEmailCode(code, userId, config.pepper), now + config.emailCodeTtlSec * 1000, now, userId);
+    try {
+      await mailer.sendVerificationCode(to.trim(), code);
+      return true;
+    } catch (err) {
+      console.error('[mailer] no se pudo enviar el código:', err.message);
+      return false;
+    }
+  }
+
+  const emailNotVerified = (res) => res.status(403).json({
+    error: 'Primero verifica tu correo con el código que te enviamos', emailVerificationRequired: true,
+  });
 
   /** Crea un secreto TOTP nuevo (sin activar) y devuelve el QR para escanearlo con el Authenticator. */
   async function startMfaSetup(userId, dek, account) {
@@ -61,7 +90,7 @@ export function authRouter(db, config) {
     res.json({ user: { id: user.id }, ...issueSession(db, user.id, auth.dek, config) });
   });
 
-  // El registro no entrega sesión: primero hay que escanear el QR y confirmar un código.
+  // El registro no entrega sesión ni QR: primero se verifica el correo, luego el login muestra el QR.
   r.post('/register', ah(async (req, res) => {
     const body = z.object({ email, password }).strict().parse(req.body);
     if (findUser(body.email)) return res.status(409).json({ error: 'Ese correo ya está registrado' });
@@ -75,11 +104,53 @@ export function authRouter(db, config) {
     } catch {
       return res.status(409).json({ error: 'Ese correo ya está registrado' });
     }
+    const emailSent = await sendEmailCode(id, body.email);
     res.status(201).json({
       user: { id },
       recoveryKey: keys.recoveryKey, // se muestra UNA sola vez
-      ...(await startMfaSetup(id, keys.dek, body.email)),
+      emailVerificationRequired: true,
+      emailSent, // false = el correo falló: la app debe ofrecer /auth/resend-code
     });
+  }));
+
+  r.post('/verify-email', ah(async (req, res) => {
+    const body = z.object({ email, code: sixDigits }).strict().parse(req.body);
+    const user = findUser(body.email);
+    if (user?.email_verified_at) return res.json({ verified: true });
+    if (!user || !user.email_code_hash) {
+      return res.status(400).json({ error: 'No hay un código pendiente para ese correo: pide uno nuevo' });
+    }
+    if (user.email_code_attempts >= config.emailCodeMaxAttempts) {
+      return res.status(400).json({ error: 'Demasiados intentos fallidos: pide un código nuevo' });
+    }
+    if (user.email_code_expires_at < Date.now()) {
+      return res.status(400).json({ error: 'El código venció: pide uno nuevo' });
+    }
+    if (!sameHash(hashEmailCode(body.code, user.id, config.pepper), user.email_code_hash)) {
+      db.prepare('UPDATE users SET email_code_attempts = email_code_attempts + 1 WHERE id=?').run(user.id);
+      const attemptsLeft = config.emailCodeMaxAttempts - user.email_code_attempts - 1;
+      return res.status(401).json({ error: 'Código incorrecto', attemptsLeft });
+    }
+    db.prepare(`UPDATE users SET email_verified_at=?, email_code_hash=NULL, email_code_expires_at=NULL,
+                email_code_attempts=0 WHERE id=?`).run(Date.now(), user.id);
+    res.json({ verified: true });
+  }));
+
+  // Respuesta genérica: no revela si el correo existe o si ya estaba verificado.
+  r.post('/resend-code', ah(async (req, res) => {
+    const body = z.object({ email }).strict().parse(req.body);
+    const user = findUser(body.email);
+    if (user && !user.email_verified_at) {
+      const wait = (user.email_code_sent_at ?? 0) + config.emailResendCooldownSec * 1000 - Date.now();
+      if (wait > 0) {
+        const retryAfterSec = Math.ceil(wait / 1000);
+        return res.status(429).json({ error: `Espera ${retryAfterSec} s antes de pedir otro código`, retryAfterSec });
+      }
+      if (!(await sendEmailCode(user.id, body.email))) {
+        return res.status(502).json({ error: 'No se pudo enviar el correo: inténtalo más tarde' });
+      }
+    }
+    res.json({ message: 'Si el correo está registrado y sin verificar, te enviamos un código nuevo' });
   }));
 
   r.post('/mfa/setup/confirm', finishMfa(true));
@@ -95,6 +166,7 @@ export function authRouter(db, config) {
     }
     const dek = await unlockWithPassword(user, body.password, config);
     if (!dek) return res.status(401).json({ error: 'Credenciales inválidas' });
+    if (!user.email_verified_at) return emailNotVerified(res);
     // Quien aún no tiene el Authenticator configurado debe hacerlo antes de entrar.
     if (!user.totp_enabled_at) return res.json({ user: { id: user.id }, ...(await startMfaSetup(user.id, dek, body.email)) });
     res.json({ user: { id: user.id }, mfaRequired: true, mfaToken: issueMfaToken(user.id, dek) });
@@ -143,6 +215,10 @@ export function authRouter(db, config) {
     db.prepare('UPDATE users SET kdf_salt=?, kdf_n=?, wrapped_dek_pw=?, wrapped_dek_rec=? WHERE id=?')
       .run(w.salt, w.n, w.wrappedPw, rec.wrappedRec, user.id);
     revokeAllSessions(db, user.id);
+    // Sin correo verificado no se llega al Authenticator: se verifica primero y luego se hace login.
+    if (!user.email_verified_at) {
+      return res.json({ user: { id: user.id }, recoveryKey: rec.recoveryKey, emailVerificationRequired: true });
+    }
     res.json({ user: { id: user.id }, recoveryKey: rec.recoveryKey, ...(await startMfaSetup(user.id, dek, body.email)) });
   }));
 

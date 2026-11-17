@@ -1,6 +1,6 @@
 # Gastos API
 
-API en Node.js (Express + SQLite) para registrar gastos con cifrado por usuario, verificación de correo
+API en Node.js (Express + Postgres en Supabase) para registrar gastos con cifrado por usuario, verificación de correo
 y MFA obligatorio (Microsoft Authenticator, Google Authenticator o cualquier app TOTP). Todo el contenido financiero va
 cifrado; en la base de datos solo hay IDs y bytes aleatorios.
 
@@ -34,7 +34,7 @@ npm start       # producción
 |---|---|---|---|
 | `PEPPER` | **sí** | — | 64 caracteres hex. Genera uno con `npm run gen-pepper` u `openssl rand -hex 32`. |
 | `PORT` | no | `3000` | Puerto HTTP. |
-| `DB_PATH` | no | `./data/gastos.db` | Archivo SQLite (la carpeta se crea sola). |
+| `DATABASE_URL` | **sí** | — | Cadena de conexión de Supabase (Connect → *Session pooler*). Las tablas se crean solas al arrancar. Para desarrollo sin red: `pglite:./data/pg` (requiere las devDependencies). |
 | `CORS_ORIGINS` | no | vacío | Orígenes permitidos separados por coma, o `*` para todos. |
 | `TRUST_PROXY` | no | — | `1` si la API está detrás de un proxy (nginx, Render, etc.) para que el límite de intentos use la IP real. |
 | `AUTH_RATE_MAX` | no | `20` | Peticiones por IP cada 15 min a **todas** las rutas `/v1/auth/*`. |

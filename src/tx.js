@@ -65,8 +65,8 @@ export function openTx(dek, row) {
 }
 
 /** Todas las transacciones de un usuario, descifradas. */
-export const listTx = (db, userId, dek) =>
-  db.prepare('SELECT * FROM transactions WHERE user_id = ?').all(userId).map((row) => openTx(dek, row));
+export const listTx = async (db, userId, dek) =>
+  (await db.all('SELECT * FROM transactions WHERE user_id = $1', [userId])).map((row) => openTx(dek, row));
 
 /** Solo aprobadas y pendientes cuentan como gasto (no declinadas ni reembolsadas). */
 export const counts = (t) => t.status === 'approved' || t.status === 'pending';

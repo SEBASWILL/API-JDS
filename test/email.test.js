@@ -54,7 +54,7 @@ test('5 códigos incorrectos anulan el código; reenviar da uno nuevo y anula el
 
 test('el código vence a los 10 minutos', async () => {
   const r = await signUp('vence@test.com');
-  s.db.prepare('UPDATE users SET email_code_expires_at = ? WHERE id = ?').run(Date.now() - 1, r.body.user.id);
+  await s.db.run('UPDATE users SET email_code_expires_at = $1 WHERE id = $2', [Date.now() - 1, r.body.user.id]);
   const res = await verify('vence@test.com', mailer.lastCode('vence@test.com'));
   assert.equal(res.status, 400);
   assert.match(res.body.error, /venció/);
@@ -62,7 +62,7 @@ test('el código vence a los 10 minutos', async () => {
 
 test('el código se guarda como HMAC, nunca en claro', async () => {
   const r = await signUp('hash@test.com');
-  const row = s.db.prepare('SELECT * FROM users WHERE id = ?').get(r.body.user.id);
+  const row = await s.db.get('SELECT * FROM users WHERE id = $1', [r.body.user.id]);
   const code = mailer.lastCode('hash@test.com');
   assert.ok(Buffer.isBuffer(row.email_code_hash) && row.email_code_hash.length === 32);
   assert.ok(!row.email_code_hash.toString('hex').includes(code));
@@ -103,7 +103,7 @@ test('resend-code respeta la espera entre envíos', async () => {
     assert.equal(r.status, 429);
     assert.ok(r.body.retryAfterSec > 0 && r.body.retryAfterSec <= 60);
   } finally {
-    slow.stop();
+    await slow.stop();
   }
 });
 
@@ -116,6 +116,6 @@ test('el límite de intentos responde 429 en JSON', async () => {
     assert.equal(typeof r.body.error, 'string');
     assert.ok(r.body.retryAfterSec > 0);
   } finally {
-    tiny.stop();
+    await tiny.stop();
   }
 });

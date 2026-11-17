@@ -30,8 +30,8 @@ export function goalsRouter(db, config) {
   const r = Router();
   r.use(requireAuth(db));
 
-  const all = (req) =>
-    db.prepare('SELECT * FROM goals WHERE user_id = ?').all(req.auth.userId)
+  const all = async (req) =>
+    (await db.all('SELECT * FROM goals WHERE user_id = $1', [req.auth.userId]))
       .map((row) => open(req.auth.dek, row))
       .sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
   const taken = (goals, category, exceptId) => goals.some((g) => g.category === category && g.id !== exceptId);
@@ -39,16 +39,16 @@ export function goalsRouter(db, config) {
   r.post('/', ah(async (req, res) => {
     const b = createSchema.parse(req.body);
     const category = b.category ?? null;
-    if (taken(all(req), category)) return res.status(409).json({ error: 'Ya tienes una meta para esa categoría' });
+    if (taken(await all(req), category)) return res.status(409).json({ error: 'Ya tienes una meta para esa categoría' });
     const id = newId();
     const now = new Date().toISOString();
     const payload = { category, limit: b.limit, currency: 'COP', created_at: now, updated_at: now };
-    db.prepare('INSERT INTO goals (id,user_id,data) VALUES (?,?,?)')
-      .run(id, req.auth.userId, seal(req.auth.dek, req.auth.userId, id, payload));
+    await db.run('INSERT INTO goals (id,user_id,data) VALUES ($1,$2,$3)',
+      [id, req.auth.userId, seal(req.auth.dek, req.auth.userId, id, payload)]);
     res.status(201).json(pub({ id, ...payload }));
   }));
 
-  r.get('/', ah(async (req, res) => res.json(all(req).map(pub))));
+  r.get('/', ah(async (req, res) => res.json((await all(req)).map(pub))));
 
   // Avance del mes en curso (en la zona horaria del usuario). Se declara antes de /:id.
   r.get('/progress', ah(async (req, res) => {
@@ -60,10 +60,10 @@ export function goalsRouter(db, config) {
     const dim = daysInMonth(y, m);
     const left = dim - d + 1; // incluye hoy
 
-    const spentTx = listTx(db, req.auth.userId, req.auth.dek).filter(counts)
+    const spentTx = (await listTx(db, req.auth.userId, req.auth.dek)).filter(counts)
       .filter((t) => dayKey(new Date(t.occurred_at), tz).startsWith(month));
 
-    const goals = all(req)
+    const goals = (await all(req))
       .sort((a, b) => (a.category === null ? -1 : b.category === null ? 1 : a.category.localeCompare(b.category)))
       .map((g) => {
         const spent = r2(spentTx.reduce((a, t) => a + (g.category === null || t.category === g.category ? t.amount : 0), 0));
@@ -81,7 +81,7 @@ export function goalsRouter(db, config) {
   }));
 
   r.patch('/:id', ah(async (req, res) => {
-    const row = db.prepare('SELECT * FROM goals WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.userId);
+    const row = await db.get('SELECT * FROM goals WHERE id = $1 AND user_id = $2', [req.params.id, req.auth.userId]);
     if (!row) return res.status(404).json({ error: 'No encontrado' });
     const changes = updateSchema.parse(req.body);
     const { id, ...current } = open(req.auth.dek, row);
@@ -89,15 +89,15 @@ export function goalsRouter(db, config) {
     if ('limit' in changes) next.limit = changes.limit;
     if ('category' in changes) {
       next.category = changes.category ?? null;
-      if (taken(all(req), next.category, id)) return res.status(409).json({ error: 'Ya tienes una meta para esa categoría' });
+      if (taken(await all(req), next.category, id)) return res.status(409).json({ error: 'Ya tienes una meta para esa categoría' });
     }
-    db.prepare('UPDATE goals SET data = ? WHERE id = ? AND user_id = ?')
-      .run(seal(req.auth.dek, req.auth.userId, id, next), id, req.auth.userId);
+    await db.run('UPDATE goals SET data = $1 WHERE id = $2 AND user_id = $3',
+      [seal(req.auth.dek, req.auth.userId, id, next), id, req.auth.userId]);
     res.json(pub({ id, ...next }));
   }));
 
   r.delete('/:id', ah(async (req, res) => {
-    const info = db.prepare('DELETE FROM goals WHERE id = ? AND user_id = ?').run(req.params.id, req.auth.userId);
+    const info = await db.run('DELETE FROM goals WHERE id = $1 AND user_id = $2', [req.params.id, req.auth.userId]);
     if (!info.changes) return res.status(404).json({ error: 'No encontrado' });
     res.status(204).end();
   }));

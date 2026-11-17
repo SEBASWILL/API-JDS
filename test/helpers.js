@@ -42,11 +42,32 @@ export async function registerWithMfa(api, email, password = 'una-clave-larga-12
   return { ...r.body, ...c.body, totpSecret: secret };
 }
 
+/** Lee todos los archivos que PGlite escribió en disco (equivale al "archivo crudo" de la base). */
+export async function rawDbFiles(db) {
+  await db.exec('CHECKPOINT');
+  const chunks = [];
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else chunks.push(fs.readFileSync(p));
+    }
+  };
+  walk(db.dataDir);
+  return Buffer.concat(chunks);
+}
+
+/** Abre una base PGlite en una carpeta temporal nueva. */
+export async function openTestDb(prefix = 'gastos-') {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const db = await openDb('pglite:' + path.join(dir, 'pg'));
+  const close = async () => { await db.close(); fs.rmSync(dir, { recursive: true, force: true }); };
+  return { db, close };
+}
+
 export async function startServer(extraEnv = {}) {
   const env = { PEPPER: 'a'.repeat(64), SCRYPT_N: '1024', AUTH_RATE_MAX: '1000', EMAIL_RESEND_COOLDOWN_SEC: '0', ...extraEnv };
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gastos-'));
-  const dbFile = path.join(dir, 'test.db');
-  const db = openDb(dbFile);
+  const { db, close } = await openTestDb();
   const app = createApp(db, loadConfig(env), { mailer });
   const server = await new Promise((ok) => { const s = app.listen(0, () => ok(s)); });
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -61,6 +82,6 @@ export async function startServer(extraEnv = {}) {
     return { status: res.status, body: text ? JSON.parse(text) : null };
   };
   const register = (email, password) => registerWithMfa(api, email, password);
-  const stop = () => { server.close(); db.close(); fs.rmSync(dir, { recursive: true, force: true }); };
-  return { api, register, db, dbFile, stop };
+  const stop = async () => { server.closeAllConnections?.(); server.close(); await close(); };
+  return { api, register, db, stop };
 }

@@ -10,7 +10,7 @@ export function loadConfig(env = process.env) {
   return {
     defaultTz,
     port: Number(env.PORT || 3000),
-    dbPath: env.DB_PATH || './data/gastos.db',
+    databaseUrl: env.DATABASE_URL || '', // Supabase: Connect -> Session pooler
     pepper: Buffer.from(pepperHex, 'hex'),
     scryptN: Number(env.SCRYPT_N || 32768),
     authRateMax: Number(env.AUTH_RATE_MAX || 20),

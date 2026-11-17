@@ -1,7 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import { startServer } from './helpers.js';
+import { startServer, rawDbFiles } from './helpers.js';
 import { dayKey, addDays, weekStart, daysInMonth } from '../src/dates.js';
 
 let s;
@@ -168,10 +167,9 @@ test('aislamiento: nadie ve, edita ni borra metas o reportes de otro', async () 
 test('DUMP: las metas tampoco aparecen en claro en la base de datos', async () => {
   const { accessToken: t } = await s.register('dump-metas@test.com');
   await s.api('POST', '/v1/goals', { category: 'meta-categoria-secreta-555', limit: 7654321 }, t);
-  s.db.pragma('wal_checkpoint(TRUNCATE)');
-  const raw = fs.readFileSync(s.dbFile);
+  const raw = await rawDbFiles(s.db);
   let cells = '';
-  for (const row of s.db.prepare('SELECT * FROM goals').all()) {
+  for (const row of await s.db.all('SELECT * FROM goals')) {
     for (const v of Object.values(row)) cells += Buffer.isBuffer(v) ? v.toString('latin1') + v.toString('base64') + v.toString('hex') : String(v);
   }
   for (const secret of ['meta-categoria-secreta-555', '7654321']) {
@@ -185,8 +183,8 @@ test('integridad: una meta movida a otra fila se detecta', async () => {
   const { accessToken: t } = await s.register('tamper-goals@test.com');
   const g1 = await s.api('POST', '/v1/goals', { limit: 1000 }, t);
   const g2 = await s.api('POST', '/v1/goals', { category: 'ocio', limit: 2000 }, t);
-  const blob = s.db.prepare('SELECT data FROM goals WHERE id=?').get(g1.body.id).data;
-  s.db.prepare('UPDATE goals SET data=? WHERE id=?').run(blob, g2.body.id);
+  const { data: blob } = await s.db.get('SELECT data FROM goals WHERE id=$1', [g1.body.id]);
+  await s.db.run('UPDATE goals SET data=$1 WHERE id=$2', [blob, g2.body.id]);
   const r = await s.api('GET', '/v1/goals', null, t);
   assert.equal(r.status, 500);
   assert.match(r.body.error, /Integridad/);

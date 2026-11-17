@@ -1,5 +1,5 @@
 # Lo que NO se sube a Elastic Beanstalk.
-# node_modules: Beanstalk ejecuta "npm install" en Linux (better-sqlite3 compilado en Windows no sirve allá).
+# node_modules: Beanstalk ejecuta "npm install" en Linux.
 node_modules
 # Secretos: en Beanstalk se configuran como variables de entorno.
 .env

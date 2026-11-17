@@ -1,18 +1,14 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { loadConfig } from '../src/config.js';
-import { openDb } from '../src/db.js';
 import { createApp } from '../src/app.js';
 import { parseAmount } from '../src/amount.js';
 import { base32Decode } from '../src/totp.js';
-import { registerWithMfa, totpFor, mailer } from './helpers.js';
+import { registerWithMfa, totpFor, mailer, openTestDb, rawDbFiles } from './helpers.js';
 
 const PEPPER = 'a'.repeat(64);
 const env = { PEPPER, SCRYPT_N: '1024', AUTH_RATE_MAX: '1000', EMAIL_RESEND_COOLDOWN_SEC: '0' };
-let dir, dbFile, db, server, base;
+let db, closeDb, server, base;
 
 const api = async (method, url, body, token) => {
   const res = await fetch(base + url, {
@@ -27,14 +23,12 @@ const api = async (method, url, body, token) => {
 const register = (email, password) => registerWithMfa(api, email, password);
 
 before(async () => {
-  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gastos-'));
-  dbFile = path.join(dir, 'test.db');
-  db = openDb(dbFile);
+  ({ db, close: closeDb } = await openTestDb());
   const app = createApp(db, loadConfig(env), { mailer });
   await new Promise((ok) => { server = app.listen(0, ok); });
   base = `http://127.0.0.1:${server.address().port}`;
 });
-after(() => { server.close(); db.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+after(async () => { server.closeAllConnections?.(); server.close(); await closeDb(); });
 
 test('parseAmount entiende formatos colombianos y anglosajones', () => {
   assert.equal(parseAmount('$25.000,00'), 25000);
@@ -141,12 +135,11 @@ test('DUMP: la base de datos no contiene ningún dato en claro', async () => {
   // El secreto TOTP en bytes tampoco debe aparecer.
   const totpRaw = base32Decode(totpSecret);
 
-  db.pragma('wal_checkpoint(TRUNCATE)');
-  const raw = fs.readFileSync(dbFile);
-  // Además del archivo crudo, miramos cada celda como texto, base64 y hex.
+  const raw = await rawDbFiles(db);
+  // Además de los archivos crudos, miramos cada celda como texto, base64 y hex.
   let cells = '';
-  for (const { name } of db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {
-    for (const row of db.prepare(`SELECT * FROM ${name}`).all()) {
+  for (const { name } of await db.all("SELECT table_name AS name FROM information_schema.tables WHERE table_schema='public'")) {
+    for (const row of await db.all(`SELECT * FROM ${name}`)) {
       for (const v of Object.values(row)) {
         cells += Buffer.isBuffer(v) ? v.toString('latin1') + v.toString('base64') + v.toString('hex') : String(v);
       }
@@ -165,8 +158,8 @@ test('integridad: mover/alterar un blob cifrado se detecta', async () => {
   const { accessToken: t, user } = await register('tamper@test.com');
   const t1 = await api('POST', '/v1/transactions', { merchant: 'uno', amount: 1 }, t);
   const t2 = await api('POST', '/v1/transactions', { merchant: 'dos', amount: 2 }, t);
-  const blob = db.prepare('SELECT data FROM transactions WHERE id=?').get(t1.body.id).data;
-  db.prepare('UPDATE transactions SET data=? WHERE id=?').run(blob, t2.body.id);
+  const { data: blob } = await db.get('SELECT data FROM transactions WHERE id=$1', [t1.body.id]);
+  await db.run('UPDATE transactions SET data=$1 WHERE id=$2', [blob, t2.body.id]);
   const r = await api('GET', `/v1/transactions/${t2.body.id}`, null, t);
   assert.equal(r.status, 500);
   assert.match(r.body.error, /Integridad/);

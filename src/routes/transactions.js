@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { ah, requireAuth } from '../middleware.js';
-import { createSchema, updateSchema, sealTx, openTx, STATUSES } from '../tx.js';
+import { createSchema, updateSchema, sealTx, openTx, listTx, STATUSES } from '../tx.js';
 import { newId } from '../crypto.js';
 
 const listQuery = z.object({
@@ -19,13 +19,11 @@ export function transactionsRouter(db) {
   const r = Router();
   r.use(requireAuth(db));
 
-  const rowsOf = (userId) => db.prepare('SELECT * FROM transactions WHERE user_id = ?').all(userId);
-  const getRow = (id, userId) => db.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').get(id, userId);
+  const getRow = (id, userId) => db.get('SELECT * FROM transactions WHERE id = $1 AND user_id = $2', [id, userId]);
 
   // Como todo está cifrado, el filtrado se hace en memoria tras descifrar (suficiente para uso personal).
-  function filtered(req, q) {
-    return rowsOf(req.auth.userId)
-      .map((row) => openTx(req.auth.dek, row))
+  async function filtered(req, q) {
+    return (await listTx(db, req.auth.userId, req.auth.dek))
       .filter((t) =>
         (!q.from || t.occurred_at >= new Date(q.from).toISOString()) &&
         (!q.to || t.occurred_at <= new Date(q.to).toISOString()) &&
@@ -48,21 +46,21 @@ export function transactionsRouter(db) {
       occurred_at: b.occurred_at ? new Date(b.occurred_at).toISOString() : now,
       created_at: now, updated_at: now,
     };
-    db.prepare('INSERT INTO transactions (id,user_id,data) VALUES (?,?,?)')
-      .run(id, req.auth.userId, sealTx(req.auth.dek, req.auth.userId, id, payload));
+    await db.run('INSERT INTO transactions (id,user_id,data) VALUES ($1,$2,$3)',
+      [id, req.auth.userId, sealTx(req.auth.dek, req.auth.userId, id, payload)]);
     res.status(201).json({ id, ...payload });
   }));
 
   r.get('/', ah(async (req, res) => {
     const q = listQuery.parse(req.query);
-    const all = filtered(req, q);
+    const all = await filtered(req, q);
     res.json({ total: all.length, limit: q.limit, offset: q.offset, items: all.slice(q.offset, q.offset + q.limit) });
   }));
 
   // Resumen para la web: no cuenta las declinadas ni las reembolsadas.
   r.get('/summary', ah(async (req, res) => {
     const q = listQuery.pick({ from: true, to: true }).parse(req.query);
-    const all = filtered(req, q);
+    const all = await filtered(req, q);
     const counted = all.filter((t) => t.status === 'approved' || t.status === 'pending');
     const sum = (list) => Math.round(list.reduce((a, t) => a + t.amount, 0) * 100) / 100;
     const group = (key) => {
@@ -78,26 +76,26 @@ export function transactionsRouter(db) {
   }));
 
   r.get('/:id', ah(async (req, res) => {
-    const row = getRow(req.params.id, req.auth.userId);
+    const row = await getRow(req.params.id, req.auth.userId);
     if (!row) return res.status(404).json({ error: 'No encontrado' });
     res.json(openTx(req.auth.dek, row));
   }));
 
   r.patch('/:id', ah(async (req, res) => {
-    const row = getRow(req.params.id, req.auth.userId);
+    const row = await getRow(req.params.id, req.auth.userId);
     if (!row) return res.status(404).json({ error: 'No encontrado' });
     const changes = updateSchema.parse(req.body);
     const { id, ...current } = openTx(req.auth.dek, row);
     const next = { ...current, ...changes, updated_at: new Date().toISOString() };
     if (changes.occurred_at) next.occurred_at = new Date(changes.occurred_at).toISOString();
     if (next.type === 'cash') next.card = null;
-    db.prepare('UPDATE transactions SET data = ? WHERE id = ? AND user_id = ?')
-      .run(sealTx(req.auth.dek, req.auth.userId, id, next), id, req.auth.userId);
+    await db.run('UPDATE transactions SET data = $1 WHERE id = $2 AND user_id = $3',
+      [sealTx(req.auth.dek, req.auth.userId, id, next), id, req.auth.userId]);
     res.json({ id, ...next });
   }));
 
   r.delete('/:id', ah(async (req, res) => {
-    const info = db.prepare('DELETE FROM transactions WHERE id = ? AND user_id = ?').run(req.params.id, req.auth.userId);
+    const info = await db.run('DELETE FROM transactions WHERE id = $1 AND user_id = $2', [req.params.id, req.auth.userId]);
     if (!info.changes) return res.status(404).json({ error: 'No encontrado' });
     res.status(204).end();
   }));

@@ -17,8 +17,8 @@ export function ingestRouter(db) {
       description: b.description ?? null, status: b.status, category: null,
       source: 'ios-shortcut', created_at: now, updated_at: now,
     };
-    db.prepare('INSERT INTO transactions (id,user_id,data) VALUES (?,?,?)')
-      .run(id, req.auth.userId, sealTx(req.auth.dek, req.auth.userId, id, payload));
+    await db.run('INSERT INTO transactions (id,user_id,data) VALUES ($1,$2,$3)',
+      [id, req.auth.userId, sealTx(req.auth.dek, req.auth.userId, id, payload)]);
     res.status(201).json({ id });
   }));
 

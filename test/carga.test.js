@@ -26,14 +26,10 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { loadConfig } from '../src/config.js';
-import { openDb } from '../src/db.js';
 import { createApp } from '../src/app.js';
 import { emailLookup } from '../src/crypto.js';
-import { registerWithMfa, mailer } from './helpers.js';
+import { registerWithMfa, mailer, openTestDb } from './helpers.js';
 
 const N = Number(process.env.CARGA_N || 50);
 // scrypt exige que su parámetro N sea una potencia de 2 (limitación de Node, no de la API).
@@ -54,8 +50,7 @@ const PEPPER = 'a'.repeat(64);
 
 async function boot() {
   const env = { PEPPER, SCRYPT_N, AUTH_RATE_MAX: String(N * 10 + 1000), EMAIL_RESEND_COOLDOWN_SEC: '0' };
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gastos-carga-'));
-  const db = openDb(path.join(dir, 'test.db'));
+  const { db, close } = await openTestDb('gastos-carga-');
   // El mailer falso guarda los códigos de verificación; sin él, registerWithMfa no puede
   // leer el código del correo y el registro nunca se completa.
   const app = createApp(db, loadConfig(env), { mailer });
@@ -72,7 +67,7 @@ async function boot() {
     try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
     return { status: res.status, body: parsed };
   };
-  const stop = () => { server.closeAllConnections?.(); server.close(); db.close(); fs.rmSync(dir, { recursive: true, force: true }); };
+  const stop = async () => { server.closeAllConnections?.(); server.close(); await close(); };
   return { api, db, stop };
 }
 
@@ -114,8 +109,9 @@ test(`carga: ${N} registros con correos DISTINTOS, lanzados todos a la vez`, asy
   assert.deepEqual(estados, { 201: N }, `se esperaban ${N} códigos 201, salió ${JSON.stringify(estados)}`);
 
   // Se confirma contra la base: debe haber una fila por cada correo (se busca por su HMAC).
-  const buscar = s.db.prepare('SELECT COUNT(*) n FROM users WHERE email_lookup = ?');
-  const faltan = emails.filter((e) => buscar.get(emailLookup(e, Buffer.from(PEPPER, 'hex'))).n !== 1);
+  const contar = (e) => s.db.get('SELECT COUNT(*) n FROM users WHERE email_lookup = $1', [emailLookup(e, Buffer.from(PEPPER, 'hex'))]);
+  const conteos = await Promise.all(emails.map(contar));
+  const faltan = emails.filter((_, i) => conteos[i].n !== 1);
   assert.deepEqual(faltan, [], 'hay correos sin su fila en la tabla users: alguna escritura se perdió');
 });
 
@@ -131,8 +127,8 @@ test('carga: muchos registros con el MISMO correo a la vez -> solo uno se crea (
   assert.equal((estados['201'] || 0) + (estados['409'] || 0), N, `cada intento debía terminar en 201 o 409, salió ${JSON.stringify(estados)}`);
 
   // No basta con mirar los códigos de respuesta: se confirma también contra la base.
-  const filas = s.db.prepare('SELECT COUNT(*) n FROM users WHERE email_lookup = ?')
-    .get(emailLookup(email, Buffer.from(PEPPER, 'hex'))).n;
+  const { n: filas } = await s.db.get('SELECT COUNT(*) n FROM users WHERE email_lookup = $1',
+    [emailLookup(email, Buffer.from(PEPPER, 'hex'))]);
   assert.equal(filas, 1, `en la base quedaron ${filas} cuentas para el mismo correo`);
 });
 

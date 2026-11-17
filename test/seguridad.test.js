@@ -16,13 +16,9 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { loadConfig } from '../src/config.js';
-import { openDb } from '../src/db.js';
 import { createApp } from '../src/app.js';
-import { registerWithMfa, totpFor, mailer } from './helpers.js';
+import { registerWithMfa, totpFor, mailer, openTestDb } from './helpers.js';
 
 const PW = 'una-clave-larga-123';
 
@@ -40,8 +36,7 @@ const wrongCode = (code) => String((Number(code) + 1) % 1e6).padStart(6, '0');
 
 async function boot(extraEnv = {}) {
   const env = { PEPPER: 'a'.repeat(64), SCRYPT_N: '1024', AUTH_RATE_MAX: '1000', EMAIL_RESEND_COOLDOWN_SEC: '0', ...extraEnv };
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gastos-seg-'));
-  const db = openDb(path.join(dir, 'test.db'));
+  const { db, close } = await openTestDb('gastos-seg-');
   // El mailer falso guarda los códigos de verificación: sin él, registerWithMfa no puede
   // leer el código del correo y el registro nunca se completa.
   const app = createApp(db, loadConfig(env), { mailer });
@@ -57,7 +52,7 @@ async function boot(extraEnv = {}) {
     headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     body: body !== undefined && body !== null ? JSON.stringify(body) : undefined,
   });
-  const stop = () => { server.closeAllConnections?.(); server.close(); db.close(); fs.rmSync(dir, { recursive: true, force: true }); };
+  const stop = async () => { server.closeAllConnections?.(); server.close(); await close(); };
   return { api, raw, db, stop };
 }
 
@@ -166,7 +161,7 @@ test('rate limit: tras varios intentos fallidos el login se bloquea (429)', asyn
     const despues = await limited.api('POST', '/v1/auth/login', { email: 'bruteforce@test.com', password: 'clave-correcta-123' });
     assert.equal(despues.status, 429, 'bloqueado, pero la clave correcta sí entró');
   } finally {
-    limited.stop();
+    await limited.stop();
   }
 });
 
@@ -190,7 +185,7 @@ test('rate limit: el cupo se comparte entre registro, login y verificación de M
     const l3 = await limited.api('POST', '/v1/auth/login', { email: 'nadie@test.com', password: 'x'.repeat(12) });
     assert.equal(l3.status, 429, 'el cupo no se compartió como se esperaba entre /register y /login');
   } finally {
-    limited.stop();
+    await limited.stop();
   }
 });
 
@@ -235,7 +230,7 @@ test('MFA: el total de intentos queda acotado por el límite de peticiones, no e
     }
     assert.ok(bloqueado, 'tras varias rondas de login + intento fallido, el límite de peticiones nunca actuó');
   } finally {
-    limited.stop();
+    await limited.stop();
   }
 });
 
@@ -281,7 +276,7 @@ test('SQL injection: el texto malicioso se guarda tal cual en una transacción y
   assert.equal(r.body.merchant, payload);
 
   for (const tabla of ['transactions', 'users', 'credentials']) {
-    assert.ok(s.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(tabla), `falta la tabla ${tabla}`);
+    assert.ok(await s.db.get("SELECT 1 AS ok FROM information_schema.tables WHERE table_schema='public' AND table_name=$1", [tabla]), `falta la tabla ${tabla}`);
   }
 });
 
@@ -297,7 +292,7 @@ test('SQL injection: filtros de la URL y login no se dejan manipular', async () 
 
   const login = await s.api('POST', '/v1/auth/login', { email: "' OR '1'='1", password: "' OR '1'='1" });
   assert.ok([400, 401].includes(login.status), `login con SQLi devolvió ${login.status}`);
-  assert.ok(s.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").get());
+  assert.ok((await s.db.get("SELECT 1 AS ok FROM information_schema.tables WHERE table_schema='public' AND table_name='users'")));
 });
 
 test('SQL injection y XSS en metas: se guardan como texto y la tabla goals sigue ahí', async () => {
@@ -312,7 +307,7 @@ test('SQL injection y XSS en metas: se guardan como texto y la tabla goals sigue
   assert.equal(r2.status, 201);
   assert.equal(r2.body.category, xss, 'el texto no debe alterarse al guardarlo o devolverlo');
 
-  assert.ok(s.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='goals'").get());
+  assert.ok((await s.db.get("SELECT 1 AS ok FROM information_schema.tables WHERE table_schema='public' AND table_name='goals'")));
 });
 
 // ===========================================================================
@@ -460,13 +455,12 @@ test('aislamiento: los reportes de un usuario no incluyen gastos de otro', async
 // ===========================================================================
 test('los tokens, la llave de recuperación y el secreto del Authenticator no quedan en claro en la base', async () => {
   const reg = await registerWithMfa(s.api, 'token-en-claro@test.com');
-  s.db.pragma('wal_checkpoint(TRUNCATE)');
 
   // JSON.stringify convierte los BLOB en listas de números y ocultaría cualquier texto en claro,
   // así que cada valor binario se pasa a texto (latin1) antes de buscar.
   const texto = (rows) => rows.map((row) => Object.values(row)
     .map((v) => (Buffer.isBuffer(v) ? v.toString('latin1') : String(v))).join('|')).join('\n');
-  const dump = texto(s.db.prepare('SELECT * FROM users').all()) + texto(s.db.prepare('SELECT * FROM credentials').all());
+  const dump = texto(await s.db.all('SELECT * FROM users')) + texto(await s.db.all('SELECT * FROM credentials'));
 
   const secretosDe = (token) => token.split('.'); // [id, secreto]
   for (const [nombre, secreto] of [
@@ -514,7 +508,7 @@ test('CORS: con CORS_ORIGINS=* el servidor refleja cualquier origen (confirmaci�
     });
     assert.equal(r.headers.get('access-control-allow-origin'), 'https://cualquier-sitio.example');
   } finally {
-    open.stop();
+    await open.stop();
   }
 });
 

@@ -62,37 +62,38 @@ export function newRecoveryKey(userId, dek) {
 const credKey = (secret, id, kind) => hkdf(secret, id, `gastos:cred:${kind}`);
 const credAad = (id, userId) => `cred:${id}:${userId}`;
 
-export function issueCredential(db, { userId, dek, kind, ttlSec = null, label = null }) {
+export async function issueCredential(db, { userId, dek, kind, ttlSec = null, label = null }) {
   const id = PREFIX[kind] + crypto.randomBytes(9).toString('base64url');
   const secret = crypto.randomBytes(32).toString('base64url');
   const now = Date.now();
-  db.prepare(
+  await db.run(
     `INSERT INTO credentials (id,user_id,kind,label_enc,wrapped_dek,created_at,expires_at)
-     VALUES (?,?,?,?,?,?,?)`,
-  ).run(
-    id, userId, kind,
-    label ? encrypt(dek, Buffer.from(label), `label:${id}`) : null,
-    encrypt(credKey(secret, id, kind), dek, credAad(id, userId)),
-    now,
-    ttlSec ? now + ttlSec * 1000 : null,
+     VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    [
+      id, userId, kind,
+      label ? encrypt(dek, Buffer.from(label), `label:${id}`) : null,
+      encrypt(credKey(secret, id, kind), dek, credAad(id, userId)),
+      now,
+      ttlSec ? now + ttlSec * 1000 : null,
+    ],
   );
   return `${id}.${secret}`;
 }
 
-export function issueSession(db, userId, dek, config) {
-  return {
-    accessToken: issueCredential(db, { userId, dek, kind: 'access', ttlSec: config.accessTtlSec }),
-    refreshToken: issueCredential(db, { userId, dek, kind: 'refresh', ttlSec: config.refreshTtlSec }),
-    expiresIn: config.accessTtlSec,
-  };
+export async function issueSession(db, userId, dek, config) {
+  const [accessToken, refreshToken] = await Promise.all([
+    issueCredential(db, { userId, dek, kind: 'access', ttlSec: config.accessTtlSec }),
+    issueCredential(db, { userId, dek, kind: 'refresh', ttlSec: config.refreshTtlSec }),
+  ]);
+  return { accessToken, refreshToken, expiresIn: config.accessTtlSec };
 }
 
 /** Valida un token y devuelve { userId, dek, credId, kind } o null. */
-export function authenticateToken(db, token, kinds) {
+export async function authenticateToken(db, token, kinds) {
   const parts = String(token || '').split('.');
   if (parts.length !== 2) return null;
   const [id, secret] = parts;
-  const row = db.prepare('SELECT * FROM credentials WHERE id = ?').get(id);
+  const row = await db.get('SELECT * FROM credentials WHERE id = $1', [id]);
   if (!row || row.revoked_at || !kinds.includes(row.kind)) return null;
   if (row.expires_at && row.expires_at < Date.now()) return null;
   let dek;
@@ -101,22 +102,22 @@ export function authenticateToken(db, token, kinds) {
   } catch {
     return null;
   }
-  db.prepare('UPDATE credentials SET last_used_at = ? WHERE id = ?').run(Date.now(), id);
+  await db.run('UPDATE credentials SET last_used_at = $1 WHERE id = $2', [Date.now(), id]);
   return { userId: row.user_id, dek, credId: id, kind: row.kind };
 }
 
 export const revokeCredential = (db, id) =>
-  db.prepare('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL').run(Date.now(), id);
+  db.run('UPDATE credentials SET revoked_at = $1 WHERE id = $2 AND revoked_at IS NULL', [Date.now(), id]);
 
 export const revokeAllSessions = (db, userId) =>
-  db.prepare(`UPDATE credentials SET revoked_at = ? WHERE user_id = ? AND kind IN ('access','refresh','mfa') AND revoked_at IS NULL`)
-    .run(Date.now(), userId);
+  db.run(`UPDATE credentials SET revoked_at = $1 WHERE user_id = $2 AND kind IN ('access','refresh','mfa') AND revoked_at IS NULL`,
+    [Date.now(), userId]);
 
 /** Suma un intento fallido al mfaToken y lo anula al llegar al máximo. */
-export function failMfaAttempt(db, id, max) {
-  const { attempts } = db.prepare('UPDATE credentials SET attempts = attempts + 1 WHERE id = ? RETURNING attempts').get(id);
-  if (attempts >= max) revokeCredential(db, id);
+export async function failMfaAttempt(db, id, max) {
+  const { attempts } = await db.get('UPDATE credentials SET attempts = attempts + 1 WHERE id = $1 RETURNING attempts', [id]);
+  if (attempts >= max) await revokeCredential(db, id);
 }
 
-export const decryptLabel =(row, dek) =>
+export const decryptLabel = (row, dek) =>
   row.label_enc ? decrypt(dek, row.label_enc, `label:${row.id}`).toString() : null;

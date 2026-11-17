@@ -6,7 +6,7 @@ import { createApp } from './app.js';
 try { process.loadEnvFile(); } catch { /* sin .env: se usan las variables del sistema */ }
 
 const config = loadConfig();
-const db = openDb(config.dbPath);
+const db = await openDb(config.databaseUrl);
 createApp(db, config).listen(config.port, '0.0.0.0', () => {
   console.log(`API en http://localhost:${config.port}`);
 });

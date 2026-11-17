@@ -3,14 +3,14 @@ import { authenticateToken } from './keys.js';
 
 export const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
-export const requireAuth = (db, kinds = ['access']) => (req, res, next) => {
+export const requireAuth = (db, kinds = ['access']) => ah(async (req, res, next) => {
   const header = req.get('authorization') || '';
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
-  const auth = token && authenticateToken(db, token, kinds);
+  const auth = token && (await authenticateToken(db, token, kinds));
   if (!auth) return res.status(401).json({ error: 'No autorizado' });
   req.auth = auth;
   next();
-};
+});
 
 export function errorHandler(err, req, res, _next) {
   if (err instanceof ZodError) {

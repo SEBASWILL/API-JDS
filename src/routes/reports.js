@@ -23,8 +23,8 @@ export function reportsRouter(db, config) {
   r.use(requireAuth(db));
 
   // Transacciones que cuentan como gasto, cada una con su día según la zona horaria del usuario.
-  const load = (req, tz) =>
-    listTx(db, req.auth.userId, req.auth.dek).filter(counts)
+  const load = async (req, tz) =>
+    (await listTx(db, req.auth.userId, req.auth.dek)).filter(counts)
       .map((t) => ({ t, key: dayKey(new Date(t.occurred_at), tz) }));
 
   r.get('/daily', ah(async (req, res) => {
@@ -39,7 +39,7 @@ export function reportsRouter(db, config) {
 
     const byDay = new Map();
     const merchants = new Map();
-    for (const { t, key } of load(req, tz)) {
+    for (const { t, key } of await load(req, tz)) {
       if (key < from || key > to) continue;
       const d = byDay.get(key) ?? byDay.set(key, emptyDay()).get(key);
       addTo(d, t);
@@ -77,7 +77,7 @@ export function reportsRouter(db, config) {
     // Se calcula una semana extra al inicio solo para poder comparar la primera.
     const first = addDays(weekStart(today), -7 * q.weeks);
     const buckets = Array.from({ length: q.weeks + 1 }, () => emptyDay());
-    for (const { t, key } of load(req, tz)) {
+    for (const { t, key } of await load(req, tz)) {
       const i = Math.floor(daysBetween(first, weekStart(key)) / 7);
       if (i >= 0 && i <= q.weeks) addTo(buckets[i], t);
     }

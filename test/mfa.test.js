@@ -1,10 +1,5 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import Database from 'better-sqlite3';
-import { openDb } from '../src/db.js';
 import { totpCode, verifyTotp, base32Encode, base32Decode, currentStep } from '../src/totp.js';
 import { startServer, totpFor, mailer } from './helpers.js';
 
@@ -114,31 +109,3 @@ test('recuperar con la llave reinicia el MFA: el Authenticator viejo deja de ser
   assert.equal(ok.status, 200);
 });
 
-test('migración: una base creada antes del MFA se actualiza sin perder credenciales', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gastos-mig-'));
-  const file = path.join(dir, 'old.db');
-  const old = new Database(file);
-  old.exec(`
-    CREATE TABLE users (id TEXT PRIMARY KEY, email_lookup TEXT NOT NULL UNIQUE, kdf_salt BLOB NOT NULL,
-      kdf_n INTEGER NOT NULL, wrapped_dek_pw BLOB NOT NULL, wrapped_dek_rec BLOB NOT NULL, created_at INTEGER NOT NULL);
-    CREATE TABLE credentials (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      kind TEXT NOT NULL CHECK (kind IN ('access','refresh','ingest')), label_enc BLOB, wrapped_dek BLOB NOT NULL,
-      created_at INTEGER NOT NULL, expires_at INTEGER, revoked_at INTEGER, last_used_at INTEGER);
-    INSERT INTO users VALUES ('u1', 'h', x'00', 1024, x'00', x'00', 1);
-    INSERT INTO credentials (id,user_id,kind,wrapped_dek,created_at) VALUES ('it_x', 'u1', 'ingest', x'00', 1);
-  `);
-  old.close();
-
-  const db = openDb(file);
-  const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
-  assert.ok(cols.includes('totp_enc') && cols.includes('totp_enabled_at') && cols.includes('totp_last_step'));
-  assert.ok(cols.includes('email_verified_at') && cols.includes('email_code_hash'));
-  // Las cuentas que ya existían quedan como verificadas.
-  assert.equal(db.prepare('SELECT email_verified_at FROM users WHERE id = ?').get('u1').email_verified_at, 1);
-  assert.equal(db.prepare('SELECT kind FROM credentials WHERE id = ?').get('it_x').kind, 'ingest');
-  db.prepare("INSERT INTO credentials (id,user_id,kind,wrapped_dek,created_at) VALUES ('mt_x','u1','mfa',x'00',1)").run();
-  assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'idx_cred_user'").get());
-  db.close();
-  openDb(file).close(); // abrirla otra vez no hace nada
-  fs.rmSync(dir, { recursive: true, force: true });
-});

@@ -7,6 +7,7 @@ import { ingestRouter } from './routes/ingest.js';
 import { transactionsRouter } from './routes/transactions.js';
 import { reportsRouter } from './routes/reports.js';
 import { goalsRouter } from './routes/goals.js';
+import { adminRouter } from './routes/admin.js';
 import { errorHandler } from './middleware.js';
 import { createMailer } from './mailer.js';
 
@@ -29,6 +30,7 @@ export function createApp(db, config, { mailer = createMailer(config) } = {}) {
   app.use('/v1/transactions', transactionsRouter(db));
   app.use('/v1/reports', reportsRouter(db, config));
   app.use('/v1/goals', goalsRouter(db, config));
+  app.use('/v1/admin', adminRouter(db, config));
   app.use((_req, res) => res.status(404).json({ error: 'Ruta no encontrada' }));
   app.use(errorHandler);
   return app;

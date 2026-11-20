@@ -58,6 +58,12 @@ export const SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS idx_goals_user ON goals(user_id);
 
+  -- Momento en que se registró la fila (no la fecha del gasto, que sigue cifrada). Sirve para las
+  -- estadísticas del admin sin descifrar nada. Las filas anteriores a esta columna quedan en NULL.
+  ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at bigint;
+  ALTER TABLE goals        ADD COLUMN IF NOT EXISTS created_at bigint;
+  CREATE INDEX IF NOT EXISTS idx_tx_created ON transactions(created_at);
+
   ALTER TABLE users        ENABLE ROW LEVEL SECURITY;
   ALTER TABLE credentials  ENABLE ROW LEVEL SECURITY;
   ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;

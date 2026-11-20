@@ -35,6 +35,7 @@ npm start       # producción
 | `PEPPER` | **sí** | — | 64 caracteres hex. Genera uno con `npm run gen-pepper` u `openssl rand -hex 32`. |
 | `PORT` | no | `3000` | Puerto HTTP. |
 | `DATABASE_URL` | **sí** | — | Cadena de conexión de Supabase (Connect → *Session pooler*). Las tablas se crean solas al arrancar. Para desarrollo sin red: `pglite:./data/pg` (requiere las devDependencies). |
+| `ADMIN_EMAIL` | no | — | Correo de la cuenta administradora (ver [Administrador](#administrador)). Sin él, no hay admin. |
 | `CORS_ORIGINS` | no | vacío | Orígenes permitidos separados por coma, o `*` para todos. |
 | `TRUST_PROXY` | no | — | `1` si la API está detrás de un proxy (nginx, Render, etc.) para que el límite de intentos use la IP real. |
 | `AUTH_RATE_MAX` | no | `20` | Peticiones por IP cada 15 min a **todas** las rutas `/v1/auth/*`. |
@@ -780,6 +781,33 @@ Query: `tz?`. Avance del mes en curso.
   el contador de intentos.
 - Cada usuario tiene una DEK distinta; con la de uno no se abre nada de otro.
 - El MFA es TOTP estándar (RFC 6238: SHA-1, 6 dígitos, 30 s), compatible con cualquier app de autenticación.
+
+## Administrador
+
+La cuenta registrada con `ADMIN_EMAIL` es el administrador, una vez que verificó el correo y activó el
+Authenticator. Entra como cualquier usuario y usa su `accessToken`. Un usuario normal recibe `403`.
+
+El admin **no puede descifrar nada**: no tiene la llave de ningún usuario. Solo ve metadatos (cuántos, cuándo,
+de quién por id), nunca montos, comercios, categorías, correos ni la fecha del gasto.
+
+| Método y ruta | Qué hace |
+|---|---|
+| `GET /v1/admin/stats?from=&to=&tz=` | Estadísticas del rango (por defecto, últimos 30 días; máximo 366). |
+| `GET /v1/admin/users` | Cuentas: id, fecha de registro, correo verificado, MFA, número de transacciones y metas, última actividad. |
+| `GET /v1/admin/users?email=x` | Busca la cuenta de ese correo exacto (se compara su HMAC; el correo no se guarda). |
+| `DELETE /v1/admin/users/:id` | Elimina la cuenta con sus sesiones, tokens, transacciones y metas. |
+| `DELETE /v1/admin/users/latest` | Elimina la última cuenta creada (nunca la del admin). |
+
+`/stats` devuelve:
+- `users`: total, verificadas, pendientes de verificar, con MFA, nuevas en el rango, activas en el rango, con sesión abierta.
+- `transactions`: total, en el rango, promedio por día y por usuario activo, máximo de un usuario, día con más registros.
+- `goals`: total, usuarios con metas, creadas en el rango.
+- `sessions`: logins en el rango, tokens de ingesta activos.
+- `daily`: por cada día del rango, `registros`, `transacciones`, `metas` y `logins`.
+
+El filtro de tiempo usa `created_at` de transacciones y metas: el **momento en que llegaron a la API**, guardado
+sin cifrar. La fecha del gasto (`occurred_at`) sigue cifrada. Las filas creadas antes de esta versión no tienen
+`created_at` y se cuentan en `without_registration_date`.
 
 ## Límites conocidos
 

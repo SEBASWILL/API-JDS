@@ -299,11 +299,11 @@ await db.tx(async (t) => {
   await t.run('DELETE FROM goals WHERE user_id = $1 AND id LIKE $2', [userId, `${SEED_PREFIX}%`]);
   for (const [i, tx] of txs.entries()) {
     const id = idTx(i);
-    await t.run('INSERT INTO transactions (id,user_id,data) VALUES ($1,$2,$3)', [id, userId, sealTx(dek, userId, id, tx)]);
+    await t.run('INSERT INTO transactions (id,user_id,data,created_at) VALUES ($1,$2,$3,$4)', [id, userId, sealTx(dek, userId, id, tx), Date.now()]);
   }
   for (const [i, g] of metas.entries()) {
     const id = idGoal(i);
-    await t.run('INSERT INTO goals (id,user_id,data) VALUES ($1,$2,$3)', [id, userId, encrypt(dek, Buffer.from(JSON.stringify(g)), goalAad(id))]);
+    await t.run('INSERT INTO goals (id,user_id,data,created_at) VALUES ($1,$2,$3,$4)', [id, userId, encrypt(dek, Buffer.from(JSON.stringify(g)), goalAad(id)), Date.now()]);
   }
 });
 

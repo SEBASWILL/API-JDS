@@ -46,8 +46,8 @@ export function transactionsRouter(db) {
       occurred_at: b.occurred_at ? new Date(b.occurred_at).toISOString() : now,
       created_at: now, updated_at: now,
     };
-    await db.run('INSERT INTO transactions (id,user_id,data) VALUES ($1,$2,$3)',
-      [id, req.auth.userId, sealTx(req.auth.dek, req.auth.userId, id, payload)]);
+    await db.run('INSERT INTO transactions (id,user_id,data,created_at) VALUES ($1,$2,$3,$4)',
+      [id, req.auth.userId, sealTx(req.auth.dek, req.auth.userId, id, payload), Date.now()]);
     res.status(201).json({ id, ...payload });
   }));
 

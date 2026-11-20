@@ -27,31 +27,31 @@ before(async () => { s = await startServer(); });
 after(() => s.stop());
 
 const idDe = (token) => token.split('.')[0];
-const fila = (token) => s.db.prepare('SELECT * FROM credentials WHERE id = ?').get(idDe(token));
+const fila = (token) => s.db.get('SELECT * FROM credentials WHERE id = $1', [idDe(token)]);
 /** Mueve la fecha de vencimiento del token: -1 = venció hace 1 ms; 60000 = vence en un minuto. */
 const vencer = (token, deltaMs = -1) =>
-  s.db.prepare('UPDATE credentials SET expires_at = ? WHERE id = ?').run(Date.now() + deltaMs, idDe(token));
+  s.db.run('UPDATE credentials SET expires_at = $1 WHERE id = $2', [Date.now() + deltaMs, idDe(token)]);
 
 test('TK-01 cada token se emite con su vigencia: access 1 hora, refresh 30 días, mfa 10 minutos, ingesta sin vencimiento', async () => {
   const reg = await s.register('tk01@test.com');
   const login = await s.api('POST', '/v1/auth/login', { email: 'tk01@test.com', password: PW });
   const ingesta = await s.api('POST', '/v1/ingest-tokens', { label: 'tel' }, reg.accessToken);
 
-  const vigencia = (token) => { const f = fila(token); return f.expires_at === null ? null : f.expires_at - f.created_at; };
-  assert.equal(vigencia(reg.accessToken), 60 * 60 * 1000, 'access: 1 hora');
-  assert.equal(vigencia(reg.refreshToken), 30 * 24 * 60 * 60 * 1000, 'refresh: 30 días');
-  assert.equal(vigencia(login.body.mfaToken), 10 * 60 * 1000, 'mfaToken: 10 minutos');
-  assert.equal(vigencia(ingesta.body.token), null, 'el token de ingesta no tiene vencimiento');
+  const vigencia = async (token) => { const f = await fila(token); return f.expires_at === null ? null : f.expires_at - f.created_at; };
+  assert.equal(await vigencia(reg.accessToken), 60 * 60 * 1000, 'access: 1 hora');
+  assert.equal(await vigencia(reg.refreshToken), 30 * 24 * 60 * 60 * 1000, 'refresh: 30 días');
+  assert.equal(await vigencia(login.body.mfaToken), 10 * 60 * 1000, 'mfaToken: 10 minutos');
+  assert.equal(await vigencia(ingesta.body.token), null, 'el token de ingesta no tiene vencimiento');
   assert.equal(reg.expiresIn, 3600, 'la respuesta informa expiresIn en segundos');
 });
 
 test('TK-02 un accessToken vencido da 401 (aunque haya vencido hace 1 ms); uno que vence en el futuro sigue sirviendo', async () => {
   const { accessToken: t } = await s.register('tk02@test.com');
 
-  vencer(t, 60_000); // vence dentro de un minuto: aún válido
+  await vencer(t, 60_000); // vence dentro de un minuto: aún válido
   assert.equal((await s.api('GET', '/v1/transactions', null, t)).status, 200, 'faltando 1 minuto debe servir');
 
-  vencer(t, -1); // venció hace 1 ms
+  await vencer(t, -1); // venció hace 1 ms
   for (const ruta of ['/v1/transactions', '/v1/goals', '/v1/reports/daily']) {
     assert.equal((await s.api('GET', ruta, null, t)).status, 401, `${ruta} aceptó un token vencido`);
   }
@@ -59,7 +59,7 @@ test('TK-02 un accessToken vencido da 401 (aunque haya vencido hace 1 ms); uno q
 
 test('TK-03 con el accessToken vencido, el refreshToken entrega una sesión nueva (así se mantiene la sesión abierta)', async () => {
   const reg = await s.register('tk03@test.com');
-  vencer(reg.accessToken);
+  await vencer(reg.accessToken);
   assert.equal((await s.api('GET', '/v1/transactions', null, reg.accessToken)).status, 401);
 
   const r = await s.api('POST', '/v1/auth/refresh', { refreshToken: reg.refreshToken });
@@ -70,7 +70,7 @@ test('TK-03 con el accessToken vencido, el refreshToken entrega una sesión nuev
 
 test('TK-04 un refreshToken vencido no sirve (401) y es independiente del accessToken', async () => {
   const reg = await s.register('tk04@test.com');
-  vencer(reg.refreshToken);
+  await vencer(reg.refreshToken);
 
   const r = await s.api('POST', '/v1/auth/refresh', { refreshToken: reg.refreshToken });
   assert.equal(r.status, 401);
@@ -82,7 +82,7 @@ test('TK-05 un mfaToken vencido no sirve ni para iniciar sesión ni para activar
   // a) Login con MFA ya activo
   const reg = await s.register('tk05@test.com');
   const l1 = await s.api('POST', '/v1/auth/login', { email: 'tk05@test.com', password: PW });
-  vencer(l1.body.mfaToken);
+  await vencer(l1.body.mfaToken);
   const code = totpFor(reg.totpSecret, 1);
   assert.equal((await s.api('POST', '/v1/auth/login/mfa', { mfaToken: l1.body.mfaToken, code })).status, 401, 'mfaToken vencido');
   const l2 = await s.api('POST', '/v1/auth/login', { email: 'tk05@test.com', password: PW });
@@ -96,7 +96,7 @@ test('TK-05 un mfaToken vencido no sirve ni para iniciar sesión ni para activar
   await s.api('POST', '/v1/auth/verify-email', { email, code: mailer.lastCode(email) });
   const a = await s.api('POST', '/v1/auth/login', { email, password: PW });
   assert.equal(a.body.mfaSetupRequired, true);
-  vencer(a.body.mfaToken);
+  await vencer(a.body.mfaToken);
   assert.equal((await s.api('POST', '/v1/auth/mfa/setup/confirm', { mfaToken: a.body.mfaToken, code: totpFor(a.body.mfaSetup.secret) })).status, 401, 'QR vencido');
   const b = await s.api('POST', '/v1/auth/login', { email, password: PW });
   assert.equal((await s.api('POST', '/v1/auth/mfa/setup/confirm', { mfaToken: b.body.mfaToken, code: totpFor(b.body.mfaSetup.secret) })).status, 200, 'con el QR nuevo sí se activa');
@@ -105,18 +105,18 @@ test('TK-05 un mfaToken vencido no sirve ni para iniciar sesión ni para activar
 test('TK-06 el token de ingesta (Atajo de iOS) no vence: sigue creando gastos y solo se puede revocar', async () => {
   const { accessToken: t } = await s.register('tk06@test.com');
   const tok = (await s.api('POST', '/v1/ingest-tokens', { label: 'tel' }, t)).body.token;
-  assert.equal(fila(tok).expires_at, null, 'expires_at debe ser NULL');
+  assert.equal((await fila(tok)).expires_at, null, 'expires_at debe ser NULL');
   const r = await s.api('POST', '/v1/ingest', { merchant: 'Éxito', amount: 25000 }, tok);
   assert.equal(r.status, 201);
 });
 
 test('TK-07 al usar un token se registra cuándo (last_used_at); mientras no se use queda vacío', async () => {
   const { accessToken: t } = await s.register('tk07@test.com');
-  assert.equal(fila(t).last_used_at, null, 'recién emitido: nunca usado');
+  assert.equal((await fila(t)).last_used_at, null, 'recién emitido: nunca usado');
   const antes = Date.now();
   await s.api('GET', '/v1/transactions', null, t);
   const despues = Date.now();
-  const usado = fila(t).last_used_at;
+  const usado = (await fila(t)).last_used_at;
   assert.ok(usado >= antes && usado <= despues, `last_used_at (${usado}) debía estar entre ${antes} y ${despues}`);
 });
 
@@ -128,13 +128,13 @@ test('TK-08 las credenciales vencidas se borran de la base',
     refresh = (await s.api('POST', '/v1/auth/refresh', { refreshToken: refresh })).body.refreshToken;
   }
   const userId = reg.user.id;
-  s.db.prepare('UPDATE credentials SET expires_at = 1 WHERE user_id = ? AND expires_at IS NOT NULL').run(userId); // "pasó el tiempo"
+  await s.db.run('UPDATE credentials SET expires_at = 1 WHERE user_id = $1 AND expires_at IS NOT NULL', [userId]); // "pasó el tiempo"
   // Actividad posterior: un login nuevo.
   const l = await s.api('POST', '/v1/auth/login', { email: 'tk08@test.com', password: PW });
   await s.api('POST', '/v1/auth/login/mfa', { mfaToken: l.body.mfaToken, code: totpFor(reg.totpSecret, 1) });
 
-  const vencidas = s.db.prepare('SELECT COUNT(*) n FROM credentials WHERE user_id = ? AND expires_at IS NOT NULL AND expires_at < ?')
-    .get(userId, Date.now()).n;
+  const { n: vencidas } = await s.db.get('SELECT COUNT(*) n FROM credentials WHERE user_id = $1 AND expires_at IS NOT NULL AND expires_at < $2',
+    [userId, Date.now()]);
   assert.equal(vencidas, 0, `quedan ${vencidas} credenciales vencidas en la base (debería limpiarlas)`);
 });
 
@@ -147,7 +147,7 @@ test('CF-01 con solo el PEPPER, el resto de la configuración toma sus valores p
   const c = cfg();
   assert.equal(c.defaultTz, 'America/Bogota');
   assert.equal(c.port, 3000);
-  assert.equal(c.dbPath, './data/gastos.db');
+  assert.equal(c.databaseUrl, ''); // sin DATABASE_URL la API no arranca (openDb lanza error)
   assert.equal(c.scryptN, 32768);
   assert.equal(c.authRateMax, 20);
   assert.equal(c.accessTtlSec, 3600);

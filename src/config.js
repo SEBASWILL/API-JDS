@@ -1,4 +1,5 @@
 import { isValidTz } from './dates.js';
+import { emailLookup } from './crypto.js';
 
 export function loadConfig(env = process.env) {
   const pepperHex = env.PEPPER;
@@ -27,5 +28,7 @@ export function loadConfig(env = process.env) {
     mailFrom: env.MAIL_FROM || '',
     trustProxy: env.TRUST_PROXY === '1',
     corsOrigins: (env.CORS_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
+    // La cuenta registrada con este correo es el administrador (se compara por HMAC, como el login).
+    adminLookup: env.ADMIN_EMAIL ? emailLookup(env.ADMIN_EMAIL, Buffer.from(pepperHex, 'hex')) : null,
   };
 }

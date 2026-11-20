@@ -43,8 +43,8 @@ export function goalsRouter(db, config) {
     const id = newId();
     const now = new Date().toISOString();
     const payload = { category, limit: b.limit, currency: 'COP', created_at: now, updated_at: now };
-    await db.run('INSERT INTO goals (id,user_id,data) VALUES ($1,$2,$3)',
-      [id, req.auth.userId, seal(req.auth.dek, req.auth.userId, id, payload)]);
+    await db.run('INSERT INTO goals (id,user_id,data,created_at) VALUES ($1,$2,$3,$4)',
+      [id, req.auth.userId, seal(req.auth.dek, req.auth.userId, id, payload), Date.now()]);
     res.status(201).json(pub({ id, ...payload }));
   }));
 

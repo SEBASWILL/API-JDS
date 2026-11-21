@@ -37,8 +37,11 @@ import { sealTx, openTx, counts, createSchema, amountSchema, STATUSES } from '..
 import { dayKey, addDays, weekStart } from '../src/dates.js';
 
 const SEED_PREFIX = '5eed0000-';
-const idTx = (i) => `${SEED_PREFIX}0000-4000-8000-${i.toString(16).padStart(12, '0')}`;
-const idGoal = (i) => `${SEED_PREFIX}0000-4000-9000-${i.toString(16).padStart(12, '0')}`;
+// El id es clave primaria de TODA la tabla (no por usuario): cada cuenta lleva su propia marca
+// (derivada de su id) para que el seed de un usuario no choque con el de otro.
+const marca = (userId) => crypto.createHash('sha256').update(`seed:${userId}`).digest('hex').slice(0, 4);
+const idTx = (userId, i) => `${SEED_PREFIX}${marca(userId)}-4000-8000-${i.toString(16).padStart(12, '0')}`;
+const idGoal = (userId, i) => `${SEED_PREFIX}${marca(userId)}-4000-9000-${i.toString(16).padStart(12, '0')}`;
 
 // ---------------------------------------------------------------- argumentos y utilidades
 const args = process.argv.slice(2);
@@ -348,11 +351,11 @@ await db.tx(async (t) => {
   await t.run('DELETE FROM transactions WHERE user_id = $1 AND id LIKE $2', [userId, `${SEED_PREFIX}%`]);
   await t.run('DELETE FROM goals WHERE user_id = $1 AND id LIKE $2', [userId, `${SEED_PREFIX}%`]);
   for (const [i, tx] of txs.entries()) {
-    const id = idTx(i);
+    const id = idTx(userId, i);
     await t.run('INSERT INTO transactions (id,user_id,data,created_at) VALUES ($1,$2,$3,$4)', [id, userId, sealTx(dek, userId, id, tx), Date.parse(tx.created_at)]);
   }
   for (const [i, g] of metas.entries()) {
-    const id = idGoal(i);
+    const id = idGoal(userId, i);
     await t.run('INSERT INTO goals (id,user_id,data,created_at) VALUES ($1,$2,$3,$4)', [id, userId, encrypt(dek, Buffer.from(JSON.stringify(g)), goalAad(id)), Date.parse(g.created_at)]);
   }
 });

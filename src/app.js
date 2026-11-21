@@ -10,6 +10,11 @@ import { goalsRouter } from './routes/goals.js';
 import { adminRouter } from './routes/admin.js';
 import { errorHandler } from './middleware.js';
 import { createMailer } from './mailer.js';
+import fs from 'node:fs';
+
+// La versión sale del package.json: para publicar una nueva, solo se cambia allí.
+const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+export const VERSION = pkg.version;
 
 export function createApp(db, config, { mailer = createMailer(config) } = {}) {
   const app = express();
@@ -23,7 +28,8 @@ export function createApp(db, config, { mailer = createMailer(config) } = {}) {
   }));
   app.use(express.json({ limit: '20kb' }));
 
-  app.get('/health', (_req, res) => res.json({ ok: true }));
+  app.get('/', (_req, res) => res.json({ name: pkg.name, version: VERSION, status: 'ok' }));
+  app.get('/health', (_req, res) => res.json({ ok: true, version: VERSION }));
   app.use('/v1/auth', authRouter(db, config, mailer));
   app.use('/v1/ingest-tokens', tokensRouter(db));
   app.use('/v1/ingest', ingestRouter(db));

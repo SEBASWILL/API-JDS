@@ -116,3 +116,10 @@ test('sin ADMIN_EMAIL o sin verificar el correo nadie es admin', async () => {
     await sinAdmin.stop();
   }
 });
+
+test('la raíz y /health muestran la versión que está corriendo (5.0.0)', async () => {
+  const raiz = await s.api('GET', '/');
+  assert.equal(raiz.status, 200);
+  assert.equal(raiz.body.version, '5.0.0');
+  assert.equal((await s.api('GET', '/health')).body.version, '5.0.0');
+});

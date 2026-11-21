@@ -3,9 +3,9 @@
 // YA existe (no crea usuarios, no toca su correo, contraseña, MFA ni sesiones).
 //
 // USO (desde la carpeta del proyecto):
-//   node scripts/seed-demo.js tu-correo@ejemplo.com          pide la contraseña sin mostrarla
-//   node scripts/seed-demo.js tu-correo@ejemplo.com --simular   muestra qué haría, sin escribir
-//   node scripts/seed-demo.js tu-correo@ejemplo.com --limpiar    borra SOLO los datos de demo
+//   node test/seed-demo.js tu-correo@ejemplo.com          pide la contraseña sin mostrarla
+//   node test/seed-demo.js tu-correo@ejemplo.com --simular   muestra qué haría, sin escribir
+//   node test/seed-demo.js tu-correo@ejemplo.com --limpiar    borra SOLO los datos de demo
 //   --dias=N     cuántos días hacia atrás (por defecto 14)
 //   --si         no pedir confirmación
 //
@@ -19,6 +19,11 @@
 // recuperación. El PEPPER por sí solo no basta. El script abre esa llave, cifra los datos con el
 // mismo formato que usa la API y los inserta, así la web los lee con normalidad.
 //
+// Cada transacción y meta lleva exactamente los mismos campos que genera la API (ver src/tx.js,
+// src/routes/transactions.js, ingest.js y goals.js) y se validan con sus schemas antes de escribir.
+// La columna created_at de cada fila (ms) es el momento en que "llegó" el dato, para que el panel
+// del admin (/admin/stats) muestre la actividad repartida por días y no todo en el mismo instante.
+//
 // Los datos de demo usan ids reconocibles (empiezan por 5eed0000-): volver a correr el script los
 // reemplaza (no se duplican) y --limpiar los borra sin tocar nada de lo que el usuario registró.
 
@@ -28,7 +33,7 @@ import { loadConfig } from '../src/config.js';
 import { openDb } from '../src/db.js';
 import { emailLookup, encrypt, decrypt } from '../src/crypto.js';
 import { unlockWithPassword, unlockWithRecovery } from '../src/keys.js';
-import { sealTx, openTx, counts } from '../src/tx.js';
+import { sealTx, openTx, counts, createSchema, amountSchema, STATUSES } from '../src/tx.js';
 import { dayKey, addDays, weekStart } from '../src/dates.js';
 
 const SEED_PREFIX = '5eed0000-';
@@ -100,6 +105,13 @@ const CATS = {
 const PESOS_SEMANA = { comida: 40, transporte: 32, mercado: 10, salud: 6, entretenimiento: 6, ropa: 2, servicios: 0 };
 const PESOS_FINDE = { comida: 36, entretenimiento: 26, mercado: 16, transporte: 12, ropa: 5, salud: 5, servicios: 0 };
 const TARJETAS = ['Visa •••• 4242', 'Mastercard •••• 8810'];
+// De dónde llega cada pago con tarjeta (el Atajo de iOS es lo más común; cash siempre es manual o web).
+const FUENTES_TARJETA = { 'ios-shortcut': 58, web: 22, 'ios-app': 12, android: 8 };
+
+// Campos exactos que guarda la API dentro del bloque cifrado.
+const TX_CAMPOS = ['type', 'merchant', 'amount', 'currency', 'card', 'occurred_at', 'description', 'status', 'category', 'source', 'created_at', 'updated_at'];
+const TX_FUENTES = ['manual', 'web', 'android', 'ios-app', 'ios-shortcut']; // ios-shortcut solo la pone /ingest
+const GOAL_CAMPOS = ['category', 'limit', 'currency', 'created_at', 'updated_at'];
 
 // Hechos puntuales: [hace cuántos días, hora, comercio, monto, categoría, estado, descripción]
 // "hace 0 días" = hoy. Si la hora cae en el futuro, el hecho se corre un día atrás.
@@ -132,12 +144,20 @@ function generar({ dias, today, now, rng, tz }) {
     const fecha = instante(addDays(today, -daysAgo), h, m);
     if (fecha > now) return false;
     const iso = fecha.toISOString();
+    const source = d.source ?? (d.type === 'cash' ? (rng() < 0.8 ? 'manual' : 'web') : elegirPonderado(FUENTES_TARJETA));
+    // /ingest guarda category: null. Si una del Atajo tiene categoría es porque el usuario la editó
+    // después (PATCH), así que su updated_at queda unas horas más tarde. ~10 % se dejan sin categoría.
+    let category = d.category ?? null;
+    let updated = fecha;
+    if (source === 'ios-shortcut') {
+      if (d.sinCategoria ?? rng() < 0.1) category = null;
+      else updated = new Date(Math.min(now.getTime(), fecha.getTime() + entre(20, 360) * 60000));
+    }
     out.push({
       type: d.type, merchant: d.merchant, amount: d.amount, currency: 'COP',
       card: d.type === 'cash' ? null : d.card ?? elige(TARJETAS),
       occurred_at: iso, description: d.description ?? null, status: d.status ?? 'approved',
-      category: d.category, source: d.type === 'cash' ? 'manual' : (rng() < 0.7 ? 'ios-shortcut' : 'web'),
-      created_at: iso, updated_at: iso,
+      category, source, created_at: iso, updated_at: updated.toISOString(),
     });
     return true;
   };
@@ -163,9 +183,34 @@ function generar({ dias, today, now, rng, tz }) {
 
   for (const [hace, hora, merchant, amount, category, status, description] of EVENTOS) {
     let d = hace;
-    while (d < dias && !agregar(d, hora, entre(0, 59), { type: 'card', merchant, amount, category, status, description })) d++;
+    while (d < dias && !agregar(d, hora, entre(0, 59), { type: 'card', merchant, amount, category, status, description, sinCategoria: false })) d++;
   }
   return out.sort((a, b) => (a.occurred_at < b.occurred_at ? -1 : 1));
+}
+
+// Comprueba que cada registro tenga exactamente los campos de la API y valores que ella aceptaría.
+function validarTx(t, i) {
+  const err = (m) => { throw new Error(`Transacción de demo #${i} inválida: ${m}`); };
+  const claves = Object.keys(t).sort().join();
+  if (claves !== [...TX_CAMPOS].sort().join()) err(`campos ${claves} (se esperaban ${TX_CAMPOS.join()})`);
+  if (!TX_FUENTES.includes(t.source)) err(`source "${t.source}"`);
+  if (!STATUSES.includes(t.status)) err(`status "${t.status}"`);
+  if (t.type === 'cash' && t.card !== null) err('cash con tarjeta');
+  if (t.source === 'ios-shortcut' && t.type !== 'card') err('el Atajo solo registra pagos con tarjeta');
+  if (!(Date.parse(t.created_at) <= Date.parse(t.updated_at))) err('updated_at anterior a created_at');
+  const { created_at, updated_at, source, ...cuerpo } = t;
+  const r = createSchema.safeParse({ ...cuerpo, source: source === 'ios-shortcut' ? 'manual' : source });
+  if (!r.success) err(r.error.issues.map((x) => `${x.path.join('.')}: ${x.message}`).join('; '));
+  if (r.data.amount !== t.amount || r.data.currency !== t.currency) err('monto o moneda no normalizados');
+}
+function validarMeta(g, i) {
+  const err = (m) => { throw new Error(`Meta de demo #${i} inválida: ${m}`); };
+  const claves = Object.keys(g).sort().join();
+  if (claves !== [...GOAL_CAMPOS].sort().join()) err(`campos ${claves} (se esperaban ${GOAL_CAMPOS.join()})`);
+  if (g.category !== null && (typeof g.category !== 'string' || !g.category.trim() || g.category.length > 60)) err('categoría');
+  const r = amountSchema.safeParse(g.limit);
+  if (!r.success || r.data !== g.limit) err(`límite ${g.limit}`);
+  if (g.currency !== 'COP') err('la API siempre guarda las metas en COP');
 }
 
 // Calcula el límite de una meta para que su estado actual sea el deseado (ok / warning / exceeded).
@@ -189,7 +234,7 @@ const METAS = [ // categoría (null = gasto total del mes), estado deseado, lím
 const email = args.find((a) => !a.startsWith('--')) || process.env.SEED_EMAIL;
 
 try { process.loadEnvFile(); } catch { /* sin .env: se usan las variables del sistema */ }
-if (!email) fail('Falta el correo del usuario. Uso: node scripts/seed-demo.js correo@ejemplo.com');
+if (!email) fail('Falta el correo del usuario. Uso: node test/seed-demo.js correo@ejemplo.com');
 
 let config;
 try { config = loadConfig(); } catch (e) { fail(`${e.message}\n  Revisa que el archivo .env tenga PEPPER y DATABASE_URL.`); }
@@ -209,18 +254,7 @@ console.log(`\nBase de datos : ${host}`);
 console.log(`Usuario       : ${email}`);
 console.log(`Correo verificado: ${user.email_verified_at ? 'sí' : 'NO'}   MFA activo: ${user.totp_enabled_at ? 'sí' : 'NO'}`);
 
-// Abrir la DEK del usuario.
-let dek;
-if (process.env.SEED_RECOVERY_KEY) {
-  dek = unlockWithRecovery(user, process.env.SEED_RECOVERY_KEY);
-  if (!dek) fail('La llave de recuperación (SEED_RECOVERY_KEY) no es correcta.');
-} else {
-  const password = process.env.SEED_PASSWORD ?? await preguntar('Contraseña del usuario (no se muestra): ', { oculto: true });
-  dek = await unlockWithPassword(user, password, config);
-  if (!dek) fail('Contraseña incorrecta (o el PEPPER no coincide con el de la base).');
-}
-console.log('✔ Llave del usuario abierta\n');
-
+// Borrar no necesita la contraseña: se identifica por user_id y el prefijo de los ids.
 const userId = user.id;
 const seeded = (tabla) => db.all(`SELECT id FROM ${tabla} WHERE user_id = $1 AND id LIKE $2`, [userId, `${SEED_PREFIX}%`]);
 
@@ -238,6 +272,18 @@ if (flag('--limpiar')) {
   process.exit(0);
 }
 
+// Abrir la DEK del usuario.
+let dek;
+if (process.env.SEED_RECOVERY_KEY) {
+  dek = unlockWithRecovery(user, process.env.SEED_RECOVERY_KEY);
+  if (!dek) fail('La llave de recuperación (SEED_RECOVERY_KEY) no es correcta.');
+} else {
+  const password = process.env.SEED_PASSWORD ?? await preguntar('Contraseña del usuario (no se muestra): ', { oculto: true });
+  dek = await unlockWithPassword(user, password, config);
+  if (!dek) fail('Contraseña incorrecta (o el PEPPER no coincide con el de la base).');
+}
+console.log('✔ Llave del usuario abierta\n');
+
 const dias = Math.min(60, Math.max(1, Number(opt('--dias', 14)) || 14));
 const tz = config.defaultTz;
 if (tz !== 'America/Bogota') console.log(`⚠ DEFAULT_TZ es ${tz}: las horas de demo se generan en hora de Bogotá (UTC-5).`);
@@ -246,6 +292,7 @@ const today = dayKey(now, tz);
 const rng = mulberry32(parseInt(crypto.createHash('sha256').update(userId).digest('hex').slice(0, 8), 16));
 
 const txs = generar({ dias, today, now, rng, tz });
+txs.forEach(validarTx);
 const month = today.slice(0, 7);
 const delMes = txs.filter(counts).filter((t) => dayKey(new Date(t.occurred_at), tz).startsWith(month));
 const gastadoMes = (cat) => Math.round(delMes.filter((t) => cat === null || t.category === cat).reduce((a, t) => a + t.amount, 0));
@@ -265,6 +312,7 @@ for (const [category, estado, porDefecto] of METAS) {
   const limit = gastado >= 20000 ? limiteParaEstado(gastado, estado) : porDefecto;
   metas.push({ category, limit, currency: 'COP', created_at: inicio, updated_at: inicio });
 }
+metas.forEach(validarMeta);
 
 // Resumen de lo que se va a escribir (mismas fórmulas que usa la API).
 const porSemana = {};
@@ -275,6 +323,8 @@ for (const t of txs.filter(counts)) {
 const porEstado = txs.reduce((a, t) => ({ ...a, [t.status]: (a[t.status] ?? 0) + 1 }), {});
 console.log(`Ventana: ${addDays(today, -(dias - 1))} → ${today} (${dias} días)`);
 console.log(`Transacciones a crear: ${txs.length}  (${Object.entries(porEstado).map(([k, v]) => `${v} ${k}`).join(', ')})`);
+const porFuente = txs.reduce((a, t) => ({ ...a, [t.source]: (a[t.source] ?? 0) + 1 }), {});
+console.log(`Por origen: ${Object.entries(porFuente).map(([k, v]) => `${v} ${k}`).join(', ')}   sin categoría: ${txs.filter((t) => t.category === null).length}`);
 console.log(`Gasto total (aprobadas + pendientes): ${money(txs.filter(counts).reduce((a, t) => a + t.amount, 0))}`);
 console.log('Por semana (lunes):');
 for (const [s, v] of Object.entries(porSemana).sort()) console.log(`   ${s}  ${money(v).padStart(12)}`);
@@ -299,19 +349,26 @@ await db.tx(async (t) => {
   await t.run('DELETE FROM goals WHERE user_id = $1 AND id LIKE $2', [userId, `${SEED_PREFIX}%`]);
   for (const [i, tx] of txs.entries()) {
     const id = idTx(i);
-    await t.run('INSERT INTO transactions (id,user_id,data,created_at) VALUES ($1,$2,$3,$4)', [id, userId, sealTx(dek, userId, id, tx), Date.now()]);
+    await t.run('INSERT INTO transactions (id,user_id,data,created_at) VALUES ($1,$2,$3,$4)', [id, userId, sealTx(dek, userId, id, tx), Date.parse(tx.created_at)]);
   }
   for (const [i, g] of metas.entries()) {
     const id = idGoal(i);
-    await t.run('INSERT INTO goals (id,user_id,data,created_at) VALUES ($1,$2,$3,$4)', [id, userId, encrypt(dek, Buffer.from(JSON.stringify(g)), goalAad(id)), Date.now()]);
+    await t.run('INSERT INTO goals (id,user_id,data,created_at) VALUES ($1,$2,$3,$4)', [id, userId, encrypt(dek, Buffer.from(JSON.stringify(g)), goalAad(id)), Date.parse(g.created_at)]);
   }
 });
 
 // Verificación: se vuelve a leer y descifrar todo lo escrito.
 const filas = await db.all('SELECT * FROM transactions WHERE user_id = $1 AND id LIKE $2', [userId, `${SEED_PREFIX}%`]);
-filas.forEach((row) => openTx(dek, row)); // lanza error si algo no descifra
+filas.forEach((row, i) => { // lanza error si algo no descifra o le falta algo
+  const { id, ...t } = openTx(dek, row);
+  validarTx(t, i);
+  if (row.created_at == null) throw new Error(`La transacción ${id} quedó sin created_at`);
+});
 const filasGl = await db.all('SELECT * FROM goals WHERE user_id = $1 AND id LIKE $2', [userId, `${SEED_PREFIX}%`]);
-filasGl.forEach((row) => JSON.parse(decrypt(dek, row.data, goalAad(row.id)).toString()));
+filasGl.forEach((row, i) => {
+  validarMeta(JSON.parse(decrypt(dek, row.data, goalAad(row.id)).toString()), i);
+  if (row.created_at == null) throw new Error(`La meta ${row.id} quedó sin created_at`);
+});
 await db.close();
 console.log(`\n✔ Listo: ${filas.length} transacciones y ${filasGl.length} metas guardadas y verificadas.`);
-console.log('  Entra a la web con ese usuario para verlas. Para borrarlas: node scripts/seed-demo.js ' + email + ' --limpiar\n');
+console.log('  Entra a la web con ese usuario para verlas. Para borrarlas: node test/seed-demo.js ' + email + ' --limpiar\n');
